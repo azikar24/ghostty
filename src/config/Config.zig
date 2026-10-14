@@ -3618,6 +3618,20 @@ else
 /// which is the old style.
 @"gtk-wide-tabs": bool = true,
 
+/// If `true` (default), show tabs in a sidebar on the left of the window
+/// instead of the tab bar. Tabs are grouped by the directory they were
+/// opened in: a new tab joins its parent tab's group, otherwise the group
+/// is the first working directory the shell reports (this needs shell
+/// integration). A tab stays in its group even if you `cd` elsewhere; the
+/// sidebar shows the current directory under the title when it differs.
+///
+/// The sidebar can be shown or hidden per window with the
+/// `toggle_tab_sidebar` keybind action (default `ctrl+shift+b`). The tab
+/// bar comes back while the sidebar is hidden.
+///
+/// Ignored for the quick terminal and with `gtk-titlebar-style = tabs`.
+@"gtk-tab-sidebar": bool = true,
+
 /// Custom CSS files to be loaded.
 ///
 /// GTK CSS documentation can be found at the following links:
@@ -6594,6 +6608,11 @@ pub const Keybinds = struct {
                 alloc,
                 .{ .key = .{ .unicode = 't' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .new_tab = {} },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'b' }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .toggle_tab_sidebar = {} },
             );
             try self.set.put(
                 alloc,

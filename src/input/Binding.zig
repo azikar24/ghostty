@@ -569,6 +569,11 @@ pub const Action = union(enum) {
     /// found by running `ghostty +version`.
     toggle_tab_overview,
 
+    /// Toggle the tab sidebar, which lists tabs grouped by the directory
+    /// they were opened in. Only supported on Linux (GTK). See
+    /// `gtk-tab-sidebar`.
+    toggle_tab_sidebar,
+
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
 
@@ -1383,6 +1388,7 @@ pub const Action = union(enum) {
             .goto_tab,
             .move_tab,
             .toggle_tab_overview,
+            .toggle_tab_sidebar,
             .new_split,
             .goto_split,
             .goto_window,

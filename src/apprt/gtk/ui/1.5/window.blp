@@ -147,26 +147,50 @@ template $GhosttyWindow: Adw.ApplicationWindow {
         }
       }
 
-      Box {
-        orientation: vertical;
+      // Tab sidebar (gtk-tab-sidebar). Rows are built in code, see
+      // rebuildSidebar in window.zig.
+      Adw.OverlaySplitView sidebar_split {
+        collapsed: false;
+        show-sidebar: false;
+        min-sidebar-width: 160;
+        max-sidebar-width: 280;
+        sidebar-width-fraction: 0.2;
 
-        $GhosttyDebugWarning {
-          visible: bind template.debug;
-        }
+        sidebar: Gtk.ScrolledWindow {
+          hscrollbar-policy: never;
 
-        Adw.ToastOverlay toast_overlay {
-          Adw.TabView tab_view {
-            notify::n-pages => $notify_n_pages();
-            notify::selected-page => $notify_selected_page();
-            close-page => $close_page();
-            page-attached => $page_attached();
-            page-detached => $page_detached();
-            create-window => $tab_create_window();
-            setup-menu => $setup_tab_menu();
-            menu-model: tab_context_menu;
-            shortcuts: none;
+          Gtk.ListBox sidebar_list {
+            styles [
+              "navigation-sidebar",
+            ]
+
+            selection-mode: single;
+            row-activated => $sidebar_row_activated();
           }
-        }
+        };
+
+        content: Box {
+          orientation: vertical;
+
+          $GhosttyDebugWarning {
+            visible: bind template.debug;
+          }
+
+          Adw.ToastOverlay toast_overlay {
+            Adw.TabView tab_view {
+              notify::n-pages => $notify_n_pages();
+              notify::selected-page => $notify_selected_page();
+              close-page => $close_page();
+              page-attached => $page_attached();
+              page-detached => $page_detached();
+              page-reordered => $page_reordered();
+              create-window => $tab_create_window();
+              setup-menu => $setup_tab_menu();
+              menu-model: tab_context_menu;
+              shortcuts: none;
+            }
+          }
+        };
       }
     }
   };

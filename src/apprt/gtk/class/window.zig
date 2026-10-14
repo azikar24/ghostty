@@ -256,12 +256,25 @@ pub const Window = extern struct {
         /// setup by `setup-menu`.
         context_menu_page: ?*adw.TabPage = null,
 
+        /// Flipped by `toggle_tab_sidebar`; the sidebar shows when this
+        /// differs from `gtk-tab-sidebar`.
+        sidebar_toggled: bool = false,
+
+        /// Pending idle rebuild of the sidebar rows.
+        sidebar_rebuild: ?c_uint = null,
+
+        /// True while rebuildSidebar reorders pages, so the page-reordered
+        /// signals it causes don't queue another rebuild.
+        sidebar_rebuilding: bool = false,
+
         // Template bindings
         tab_overview: *adw.TabOverview,
         tab_bar: *adw.TabBar,
         tab_view: *adw.TabView,
         toolbar: *adw.ToolbarView,
         toast_overlay: *adw.ToastOverlay,
+        sidebar_split: *adw.OverlaySplitView,
+        sidebar_list: *gtk.ListBox,
 
         pub var offset: c_int = 0;
     };
@@ -444,6 +457,13 @@ pub const Window = extern struct {
                 surfaceInit(p.rt_surface.gobj(), self);
             }
             tab.setParentWithContext(p, context);
+
+            // A new tab joins its parent's sidebar group.
+            if (context == .tab) {
+                if (ext.getAncestor(Tab, p.rt_surface.surface.as(gtk.Widget))) |parent_tab| {
+                    if (parent_tab.getGroup()) |group| _ = tab.pinGroup(group);
+                }
+            }
         }
 
         // Get the position that we should insert the new tab at.
@@ -601,6 +621,288 @@ pub const Window = extern struct {
         return tab_view.reorderPage(page, desired_pos) != 0;
     }
 
+    /// Show or hide the tab sidebar in this window. Returns false if the
+    /// sidebar doesn't apply to this window.
+    pub fn toggleTabSidebar(self: *Self) bool {
+        if (!self.sidebarAllowed()) return false;
+        const priv = self.private();
+        priv.sidebar_toggled = !priv.sidebar_toggled;
+        self.syncSidebar();
+        return true;
+    }
+
+    /// The quick terminal has no room for it and the `tabs` titlebar
+    /// style needs the tab bar for the window controls.
+    fn sidebarAllowed(self: *Self) bool {
+        const priv = self.private();
+        const config = if (priv.config) |v| v.get() else return false;
+        return !priv.quick_terminal and config.@"gtk-titlebar-style" == .native;
+    }
+
+    fn sidebarShown(self: *Self) bool {
+        const priv = self.private();
+        const config = if (priv.config) |v| v.get() else return false;
+        if (!self.sidebarAllowed()) return false;
+        return config.@"gtk-tab-sidebar" != priv.sidebar_toggled;
+    }
+
+    fn syncSidebar(self: *Self) void {
+        const priv = self.private();
+        const shown = self.sidebarShown();
+        priv.sidebar_split.setShowSidebar(@intFromBool(shown));
+        self.as(gobject.Object).notifyByPspec(properties.@"tabs-visible".impl.param_spec);
+        self.scheduleSidebarRebuild();
+    }
+
+    /// Rebuild the sidebar on idle, so a burst of changes rebuilds once.
+    fn scheduleSidebarRebuild(self: *Self) void {
+        const priv = self.private();
+        if (priv.sidebar_rebuild != null or priv.sidebar_rebuilding) return;
+        if (!self.sidebarShown()) return;
+        priv.sidebar_rebuild = glib.idleAdd(sidebarRebuildIdle, self);
+    }
+
+    fn sidebarRebuildIdle(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        const priv = self.private();
+        priv.sidebar_rebuild = null;
+        priv.sidebar_rebuilding = true;
+        defer priv.sidebar_rebuilding = false;
+        self.rebuildSidebar();
+        return 0;
+    }
+
+    fn rebuildSidebar(self: *Self) void {
+        const priv = self.private();
+        const tab_view = priv.tab_view;
+        const list = priv.sidebar_list;
+        const n: usize = @intCast(tab_view.getNPages());
+
+        for (0..n) |i| {
+            const tab = pageTab(tab_view.getNthPage(@intCast(i))) orelse continue;
+            pinGroupFromPwd(tab);
+        }
+
+        // Keep each group's tabs together, groups in order of first
+        // appearance, so tab order (next_tab, goto_tab) matches the sidebar.
+        var start: usize = 0;
+        while (start < n) {
+            const group = pageGroup(tab_view.getNthPage(@intCast(start)));
+            var end = start + 1;
+            for (end..n) |i| {
+                const page = tab_view.getNthPage(@intCast(i));
+                if (!groupEql(group, pageGroup(page))) continue;
+                if (i != end) _ = tab_view.reorderPage(page, @intCast(end));
+                end += 1;
+            }
+            start = end;
+        }
+
+        list.removeAll();
+        const selected = tab_view.getSelectedPage();
+        var prev: ?*Tab = null;
+        for (0..n) |i| {
+            const page = tab_view.getNthPage(@intCast(i));
+            const tab = pageTab(page) orelse continue;
+            if (prev == null or !groupEql(prev.?.getGroup(), tab.getGroup())) {
+                list.append(self.sidebarGroupRow(tab).as(gtk.Widget));
+            }
+            prev = tab;
+
+            const row = self.sidebarTabRow(page, tab);
+            list.append(row.as(gtk.Widget));
+            if (selected == page) list.selectRow(row);
+        }
+    }
+
+    fn sidebarGroupRow(self: *Self, tab: *Tab) *gtk.ListBoxRow {
+        const row = gtk.ListBoxRow.new();
+        row.setActivatable(0);
+        row.setSelectable(0);
+
+        const box = gtk.Box.new(.horizontal, 6);
+        box.as(gtk.Widget).setMarginTop(6);
+
+        var buf: [std.fs.max_path_bytes + 2]u8 = undefined;
+        const group = tab.getGroup();
+        const label = gtk.Label.new(if (group) |g| groupName(&buf, g) else i18n._("Starting…"));
+        label.setXalign(0);
+        label.setEllipsize(.middle);
+        label.as(gtk.Widget).setHexpand(1);
+        label.as(gtk.Widget).addCssClass("heading");
+        box.append(label.as(gtk.Widget));
+
+        if (group) |g| {
+            label.as(gtk.Widget).setTooltipText(abbrevHome(&buf, g));
+
+            const button = gtk.Button.newFromIconName("tab-new-symbolic");
+            button.as(gtk.Widget).addCssClass("flat");
+            button.as(gtk.Widget).setTooltipText(i18n._("New Tab Here"));
+            button.as(gtk.Widget).setFocusOnClick(0);
+            button.as(gobject.Object).setDataFull(
+                "ghostty-group",
+                glib.ext.dupeZ(u8, g).ptr,
+                glib.free,
+            );
+            _ = gtk.Button.signals.clicked.connect(
+                button,
+                *Self,
+                sidebarNewTabClicked,
+                self,
+                .{},
+            );
+            box.append(button.as(gtk.Widget));
+        }
+
+        row.setChild(box.as(gtk.Widget));
+        return row;
+    }
+
+    fn sidebarTabRow(self: *Self, page: *adw.TabPage, tab: *Tab) *gtk.ListBoxRow {
+        const row = gtk.ListBoxRow.new();
+        row.as(gobject.Object).setData("ghostty-page", page);
+
+        const box = gtk.Box.new(.horizontal, 6);
+        box.as(gtk.Widget).setMarginStart(10);
+
+        const text = gtk.Box.new(.vertical, 0);
+        text.as(gtk.Widget).setHexpand(1);
+        text.as(gtk.Widget).setValign(.center);
+
+        const title = gtk.Label.new(page.getTitle());
+        title.setXalign(0);
+        title.setEllipsize(.end);
+        if (page.getNeedsAttention() != 0) title.as(gtk.Widget).addCssClass("accent");
+        text.append(title.as(gtk.Widget));
+
+        // Show where the tab is now if it has left its group's directory.
+        const pwd: ?[:0]const u8 = if (tab.getActiveSurface()) |s| s.getPwd() else null;
+        if (pwd) |dir| if (!groupEql(tab.getGroup(), dir)) {
+            var buf: [std.fs.max_path_bytes + 2]u8 = undefined;
+            const sub = gtk.Label.new(abbrevHome(&buf, dir));
+            sub.setXalign(0);
+            sub.setEllipsize(.middle);
+            sub.as(gtk.Widget).addCssClass("dim-label");
+            sub.as(gtk.Widget).addCssClass("caption");
+            text.append(sub.as(gtk.Widget));
+        };
+        box.append(text.as(gtk.Widget));
+
+        const close = gtk.Button.newFromIconName("window-close-symbolic");
+        close.as(gtk.Widget).addCssClass("flat");
+        close.as(gtk.Widget).addCssClass("circular");
+        close.as(gtk.Widget).setValign(.center);
+        close.as(gtk.Widget).setTooltipText(i18n._("Close Tab"));
+        close.as(gtk.Widget).setFocusOnClick(0);
+        close.as(gobject.Object).setData("ghostty-page", page);
+        _ = gtk.Button.signals.clicked.connect(
+            close,
+            *Self,
+            sidebarCloseClicked,
+            self,
+            .{},
+        );
+        box.append(close.as(gtk.Widget));
+
+        row.setChild(box.as(gtk.Widget));
+        return row;
+    }
+
+    /// The page stored on a sidebar widget, if it is still in this window.
+    /// Rows can outlive their page until the next idle rebuild, so the
+    /// pointer is only compared, never dereferenced, until it's found.
+    fn sidebarPage(self: *Self, obj: *gobject.Object) ?*adw.TabPage {
+        const raw = obj.getData("ghostty-page") orelse return null;
+        const tab_view = self.private().tab_view;
+        const n: usize = @intCast(tab_view.getNPages());
+        for (0..n) |i| {
+            const page = tab_view.getNthPage(@intCast(i));
+            if (@intFromPtr(page) == @intFromPtr(raw)) return page;
+        }
+        return null;
+    }
+
+    fn sidebarRowActivated(
+        _: *gtk.ListBox,
+        row: *gtk.ListBoxRow,
+        self: *Self,
+    ) callconv(.c) void {
+        const page = self.sidebarPage(row.as(gobject.Object)) orelse return;
+        self.private().tab_view.setSelectedPage(page);
+        // Keep typing going to the terminal, not the list.
+        if (self.getActiveSurface()) |surface| surface.grabFocus();
+    }
+
+    fn sidebarCloseClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        const page = self.sidebarPage(button.as(gobject.Object)) orelse return;
+        self.private().tab_view.closePage(page);
+    }
+
+    fn sidebarNewTabClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        const raw = button.as(gobject.Object).getData("ghostty-group") orelse return;
+        const group = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+        const page = self.newTabPage(null, .tab, .{ .working_directory = group });
+
+        // Insert after the group's last tab rather than after the
+        // selected tab, which may be in another group.
+        const tab_view = self.private().tab_view;
+        const n: usize = @intCast(tab_view.getNPages());
+        var last: ?usize = null;
+        for (0..n) |i| {
+            const other = tab_view.getNthPage(@intCast(i));
+            if (other != page and groupEql(group, pageGroup(other))) last = i;
+        }
+        if (last) |l| {
+            const pos: usize = @intCast(tab_view.getPagePosition(page));
+            _ = tab_view.reorderPage(page, @intCast(if (pos > l) l + 1 else l));
+        }
+        if (self.getActiveSurface()) |surface| surface.grabFocus();
+    }
+
+    fn pageTab(page: *adw.TabPage) ?*Tab {
+        return gobject.ext.cast(Tab, page.getChild());
+    }
+
+    fn pageGroup(page: *adw.TabPage) ?[:0]const u8 {
+        const tab = pageTab(page) orelse return null;
+        return tab.getGroup();
+    }
+
+    fn pinGroupFromPwd(tab: *Tab) void {
+        const surface = tab.getActiveSurface() orelse return;
+        const pwd = surface.getPwd() orelse return;
+        _ = tab.pinGroup(pwd);
+    }
+
+    fn groupEql(a: ?[:0]const u8, b: ?[:0]const u8) bool {
+        const x = a orelse return b == null;
+        const y = b orelse return false;
+        return std.mem.eql(u8, x, y);
+    }
+
+    /// `dir` with $HOME shortened to `~`, written to buf.
+    fn abbrevHome(buf: []u8, dir: [:0]const u8) [:0]const u8 {
+        const home = std.posix.getenv("HOME") orelse "";
+        if (home.len > 1 and std.mem.startsWith(u8, dir, home) and
+            (dir.len == home.len or dir[home.len] == '/'))
+        {
+            return std.fmt.bufPrintZ(buf, "~{s}", .{dir[home.len..]}) catch dir;
+        }
+        return dir;
+    }
+
+    /// Short group label: the directory's name, or `~` for home.
+    fn groupName(buf: []u8, dir: [:0]const u8) [:0]const u8 {
+        const short = abbrevHome(buf, dir);
+        if (std.mem.eql(u8, short, "~") or std.mem.eql(u8, short, "/")) return short;
+        const trimmed = std.mem.trimRight(u8, short, "/");
+        const base = std.fs.path.basename(trimmed);
+        // base ends where short ends (or one before a trailing slash),
+        // so it is only NUL-terminated when nothing was trimmed.
+        if (trimmed.len != short.len) return short;
+        return short[short.len - base.len ..];
+    }
+
     pub fn toggleTabOverview(self: *Self) void {
         const priv = self.private();
         const tab_overview = priv.tab_overview;
@@ -699,6 +1001,8 @@ pub const Window = extern struct {
             .top => priv.toolbar.addTopBar(priv.tab_bar.as(gtk.Widget)),
             .bottom => priv.toolbar.addBottomBar(priv.tab_bar.as(gtk.Widget)),
         }
+
+        self.syncSidebar();
 
         // Do our window-protocol specific appearance sync.
         priv.winproto.syncAppearance() catch |err| {
@@ -815,6 +1119,13 @@ pub const Window = extern struct {
                 surfaceToggleMaximize,
                 self,
                 .{},
+            );
+            _ = gobject.Object.signals.notify.connect(
+                surface,
+                *Self,
+                surfacePwdChanged,
+                self,
+                .{ .detail = "pwd" },
             );
 
             // If we've never had a surface initialize yet, then we register
@@ -1025,6 +1336,7 @@ pub const Window = extern struct {
                 return true;
             },
             .native => {
+                if (self.sidebarShown()) return false;
                 return switch (config.@"window-show-tab-bar") {
                     .always, .auto => true,
                     .never => false,
@@ -1228,6 +1540,13 @@ pub const Window = extern struct {
         const priv = self.private();
 
         priv.command_palette.set(null);
+
+        if (priv.sidebar_rebuild) |v| {
+            if (glib.Source.remove(v) == 0) {
+                log.warn("unable to remove sidebar rebuild source", .{});
+            }
+            priv.sidebar_rebuild = null;
+        }
 
         if (priv.config) |v| {
             v.unref();
@@ -1480,6 +1799,34 @@ pub const Window = extern struct {
         // If the tab was previously marked as needing attention
         // (e.g. due to a bell character), we now unmark that
         page.setNeedsAttention(@intFromBool(false));
+
+        self.scheduleSidebarRebuild();
+    }
+
+    fn tabViewPageReordered(
+        _: *adw.TabView,
+        _: *adw.TabPage,
+        _: c_int,
+        self: *Self,
+    ) callconv(.c) void {
+        self.scheduleSidebarRebuild();
+    }
+
+    fn pageSidebarPropChanged(
+        _: *adw.TabPage,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        self.scheduleSidebarRebuild();
+    }
+
+    fn surfacePwdChanged(
+        surface: *Surface,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        if (ext.getAncestor(Tab, surface.as(gtk.Widget))) |tab| pinGroupFromPwd(tab);
+        self.scheduleSidebarRebuild();
     }
 
     fn tabViewPageAttached(
@@ -1523,6 +1870,34 @@ pub const Window = extern struct {
         if (tab.getSurfaceTree()) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+
+        // Sidebar rows show the page title, attention state and the
+        // active surface's pwd.
+        inline for (.{ "title", "needs-attention" }) |detail| {
+            _ = gobject.Object.signals.notify.connect(
+                page,
+                *Self,
+                pageSidebarPropChanged,
+                self,
+                .{ .detail = detail },
+            );
+        }
+        _ = gobject.Object.signals.notify.connect(
+            tab,
+            *Self,
+            tabSidebarPropChanged,
+            self,
+            .{ .detail = "active-surface" },
+        );
+        self.scheduleSidebarRebuild();
+    }
+
+    fn tabSidebarPropChanged(
+        _: *Tab,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        self.scheduleSidebarRebuild();
     }
 
     fn tabViewPageDetached(
@@ -1544,10 +1919,22 @@ pub const Window = extern struct {
             self,
         );
 
+        _ = gobject.signalHandlersDisconnectMatched(
+            page.as(gobject.Object),
+            .{ .data = true },
+            0,
+            0,
+            null,
+            null,
+            self,
+        );
+
         // Remove the tree handlers
         if (tab.getSurfaceTree()) |tree| {
             self.disconnectSurfaceHandlers(tree);
         }
+
+        self.scheduleSidebarRebuild();
     }
 
     fn tabViewCreateWindow(
@@ -1748,6 +2135,8 @@ pub const Window = extern struct {
         if (new_tree) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+
+        self.scheduleSidebarRebuild();
     }
 
     fn actionAbout(
@@ -2088,6 +2477,8 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("tab_overview", .{});
             class.bindTemplateChildPrivate("tab_bar", .{});
             class.bindTemplateChildPrivate("tab_view", .{});
+            class.bindTemplateChildPrivate("sidebar_split", .{});
+            class.bindTemplateChildPrivate("sidebar_list", .{});
             class.bindTemplateChildPrivate("toolbar", .{});
             class.bindTemplateChildPrivate("toast_overlay", .{});
 
@@ -2100,6 +2491,8 @@ pub const Window = extern struct {
             class.bindTemplateCallback("close_page", &tabViewClosePage);
             class.bindTemplateCallback("page_attached", &tabViewPageAttached);
             class.bindTemplateCallback("page_detached", &tabViewPageDetached);
+            class.bindTemplateCallback("page_reordered", &tabViewPageReordered);
+            class.bindTemplateCallback("sidebar_row_activated", &sidebarRowActivated);
             class.bindTemplateCallback("setup_tab_menu", &setupTabMenu);
             class.bindTemplateCallback("tab_create_window", &tabViewCreateWindow);
             class.bindTemplateCallback("notify_n_pages", &tabViewNPages);
