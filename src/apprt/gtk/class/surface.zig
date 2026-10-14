@@ -2009,6 +2009,14 @@ pub const Surface = extern struct {
         return self.private().pwd;
     }
 
+    /// The pwd, or for a terminal that hasn't reported one yet (e.g. not
+    /// shown yet, so not started) the directory it was asked to start in.
+    /// Not copied.
+    pub fn getPwdOrInitial(self: *Self) ?[:0]const u8 {
+        const priv = self.private();
+        return priv.pwd orelse priv.overrides.working_directory;
+    }
+
     /// Set the pwd for this surface, copies the value.
     pub fn setPwd(self: *Self, pwd: ?[:0]const u8) void {
         const priv = self.private();

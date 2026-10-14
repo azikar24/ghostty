@@ -36,6 +36,7 @@ const Config = @import("config.zig").Config;
 const Surface = @import("surface.zig").Surface;
 const SplitTree = @import("split_tree.zig").SplitTree;
 const Window = @import("window.zig").Window;
+const session = @import("../session.zig");
 const Tab = @import("tab.zig").Tab;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
@@ -2240,6 +2241,12 @@ const Action = struct {
         // or something we quit immediately after starting up because there
         // was a delay in the event loop before we created a Window.
         self.private().requested_window = true;
+
+        // The first plain window of the process brings back the saved
+        // session instead (see session.zig).
+        if (parent == null and overrides.command == null and overrides.working_directory == null) {
+            if (session.restore(self)) return;
+        }
 
         const win = Window.new(self, .{
             .title = overrides.title,

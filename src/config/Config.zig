@@ -3638,6 +3638,15 @@ else
 /// Ignored for the quick terminal and with `gtk-titlebar-style = tabs`.
 @"gtk-tab-sidebar": bool = true,
 
+/// If `true` (default), Ghostty saves the layout of its windows (sidebar
+/// groups and tabs, tabs, splits and each terminal's working directory) to
+/// `$XDG_STATE_HOME/ghostty/session.json` and restores it when it starts
+/// without a command (`-e`) or working directory. Running programs and
+/// scrollback are not restored. Closing the last window keeps the session.
+///
+/// Linux (GTK) only.
+@"gtk-restore-session": bool = true,
+
 /// Custom CSS files to be loaded.
 ///
 /// GTK CSS documentation can be found at the following links:

@@ -29,6 +29,7 @@ const Tab = @import("tab.zig").Tab;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
+const session = @import("../session.zig");
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 
 const log = std.log.scoped(.gtk_ghostty_window);
@@ -281,6 +282,9 @@ pub const Window = extern struct {
 
         /// Group whose rename dialog is open.
         renaming_group: u32 = 0,
+
+        /// Set once the window is going away, so the session save skips it.
+        closing: bool = false,
 
         /// Desktop notifications from this window's terminals, oldest
         /// first, listed in the sidebar until seen.
@@ -714,7 +718,10 @@ pub const Window = extern struct {
         const box = self.private().sidebar_box.as(gtk.Widget);
         if (box.getVisible() == 0 or box.getMapped() == 0) return;
         const pos = paned.getPosition();
-        if (pos >= 180) sidebar_width = pos;
+        if (pos >= 180 and pos != sidebar_width) {
+            sidebar_width = pos;
+            session.scheduleSave();
+        }
     }
 
     fn actionToggleTabSidebar(_: *gio.SimpleAction, _: ?*glib.Variant, self: *Self) callconv(.c) void {
@@ -751,6 +758,8 @@ pub const Window = extern struct {
         id: u32,
         group_id: u32,
         view: *adw.TabView,
+        /// Set by the user; otherwise the row shows the selected tab's title.
+        name: ?[:0]u8 = null,
     };
 
     var next_group_id: u32 = 1;
@@ -937,6 +946,133 @@ pub const Window = extern struct {
 
     fn focusActiveSurface(self: *Self) void {
         if (self.getActiveSurface()) |surface| surface.grabFocus();
+    }
+
+    //---------------------------------------------------------------
+    // Session
+
+    /// This window's layout for the session file. Allocates from `alloc`
+    /// (an arena; nothing is freed individually).
+    pub fn snapshot(self: *Self, alloc: std.mem.Allocator) !session.WindowState {
+        const priv = self.private();
+        var groups: std.ArrayList(session.Group) = .empty;
+        var flat: usize = 0;
+        var active: usize = 0;
+        for (priv.groups.items) |group| {
+            var tabs: std.ArrayList(session.SidebarTab) = .empty;
+            for (priv.workspaces.items) |ws| {
+                if (ws.group_id != group.id) continue;
+                const n: usize = @intCast(ws.view.getNPages());
+                if (n == 0) continue;
+                var inner: std.ArrayList(session.Tab) = .empty;
+                var selected: usize = 0;
+                for (0..n) |i| {
+                    const page = ws.view.getNthPage(@intCast(i));
+                    if (ws.view.getSelectedPage() == page) selected = i;
+                    const tab = gobject.ext.cast(Tab, page.getChild()) orelse continue;
+                    const tree = tab.getSurfaceTree() orelse continue;
+                    if (tree.isEmpty()) continue;
+                    try inner.append(alloc, .{ .tree = try snapshotNode(alloc, tree, .root) });
+                }
+                if (inner.items.len == 0) continue;
+                if (ws.view == priv.tab_view) active = flat;
+                flat += 1;
+                try tabs.append(alloc, .{
+                    .name = if (ws.name) |name| try alloc.dupe(u8, name) else null,
+                    .selected = selected,
+                    .tabs = inner.items,
+                });
+            }
+            if (tabs.items.len == 0) continue;
+            try groups.append(alloc, .{
+                .name = try alloc.dupe(u8, group.name),
+                .dir = if (group.dir) |d| try alloc.dupe(u8, d) else null,
+                .renamed = group.renamed,
+                .collapsed = group.collapsed,
+                .tabs = tabs.items,
+            });
+        }
+        return .{ .sidebar_width = sidebar_width, .active = active, .groups = groups.items };
+    }
+
+    fn snapshotNode(
+        alloc: std.mem.Allocator,
+        tree: *const Surface.Tree,
+        handle: Surface.Tree.Node.Handle,
+    ) !session.Node {
+        switch (tree.nodes[handle.idx()]) {
+            .leaf => |surface| return .{
+                .pwd = if (surface.getPwdOrInitial()) |p| try alloc.dupe(u8, p) else null,
+            },
+            .split => |split| {
+                const left = try alloc.create(session.Node);
+                left.* = try snapshotNode(alloc, tree, split.left);
+                const right = try alloc.create(session.Node);
+                right.* = try snapshotNode(alloc, tree, split.right);
+                return .{
+                    .horizontal = split.layout == .horizontal,
+                    .ratio = @floatCast(split.ratio),
+                    .left = left,
+                    .right = right,
+                };
+            },
+        }
+    }
+
+    /// Rebuild a saved layout in this new window. Returns false if nothing
+    /// could be restored (the window then has no tabs).
+    pub fn restoreState(self: *Self, state: *const session.WindowState) bool {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        if (state.sidebar_width >= 180) sidebar_width = state.sidebar_width;
+
+        var flat: usize = 0;
+        var active_id: u32 = 0;
+        for (state.groups) |saved_group| {
+            const group_id = self.addGroup(saved_group.dir);
+            if (group_id == 0) continue;
+            if (self.findGroup(group_id)) |group| {
+                group.collapsed = saved_group.collapsed;
+                if (saved_group.renamed) {
+                    if (alloc.dupeZ(u8, saved_group.name)) |name| {
+                        alloc.free(group.name);
+                        group.name = name;
+                        group.renamed = true;
+                    } else |_| {}
+                }
+            }
+
+            for (saved_group.tabs) |saved_ws| {
+                if (saved_ws.tabs.len == 0) continue;
+                const ws_id = self.addWorkspace(group_id);
+                if (ws_id == 0) continue;
+                self.activateWorkspace(ws_id);
+                if (saved_ws.name) |name| {
+                    if (self.findWorkspace(ws_id)) |ws| ws.name = alloc.dupeZ(u8, name) catch null;
+                }
+
+                for (saved_ws.tabs) |*saved_tab| {
+                    const first: ?[:0]u8 = if (saved_tab.tree.firstPwd()) |p| alloc.dupeZ(u8, p) catch null else null;
+                    defer if (first) |v| alloc.free(v);
+                    const page = self.newTabPage(null, .tab, .{ .working_directory = first });
+                    if (!saved_tab.tree.isSplit()) continue;
+                    const tab = gobject.ext.cast(Tab, page.getChild()) orelse continue;
+                    tab.getSplitTree().restoreTree(&saved_tab.tree) catch |err| {
+                        log.warn("unable to restore splits err={}", .{err});
+                    };
+                }
+
+                const view = priv.tab_view;
+                const n: usize = @intCast(view.getNPages());
+                if (n > 0) view.setSelectedPage(view.getNthPage(@intCast(@min(saved_ws.selected, n - 1))));
+                if (flat == state.active) active_id = ws_id;
+                flat += 1;
+            }
+        }
+        if (flat == 0) return false;
+        if (active_id != 0) self.activateWorkspace(active_id);
+        self.syncSidebar();
+        return true;
     }
 
     //---------------------------------------------------------------
@@ -1186,6 +1322,7 @@ pub const Window = extern struct {
         defer priv.sidebar_rebuilding = false;
         self.pruneWorkspaces();
         if (self.sidebarShown()) self.rebuildSidebar();
+        if (!priv.closing) session.scheduleSave();
         return 0;
     }
 
@@ -1203,6 +1340,7 @@ pub const Window = extern struct {
                 continue;
             }
             _ = priv.workspaces.orderedRemove(i);
+            if (ws.name) |name| alloc.free(name);
             if (ws.view == priv.tab_view) {
                 const next = priv.workspaces.items[@min(i, priv.workspaces.items.len - 1)];
                 self.activateWorkspace(next.id);
@@ -2153,6 +2291,7 @@ pub const Window = extern struct {
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
+        priv.closing = true;
 
         priv.command_palette.set(null);
 
@@ -2186,6 +2325,7 @@ pub const Window = extern struct {
         const alloc = Application.default().allocator();
         for (priv.groups.items) |*g| g.deinit(alloc);
         priv.groups.deinit(alloc);
+        for (priv.workspaces.items) |ws| if (ws.name) |name| alloc.free(name);
         priv.workspaces.deinit(alloc);
         for (priv.notifications.items) |*n| n.deinit(alloc);
         priv.notifications.deinit(alloc);
@@ -2320,14 +2460,27 @@ pub const Window = extern struct {
             return @intFromBool(true);
         }
 
+        self.markClosing();
         self.as(gtk.Window).destroy();
         return @intFromBool(false);
+    }
+
+    /// Leave this window out of the saved session from now on, and save
+    /// the remaining windows (if none remain the session is kept).
+    fn markClosing(self: *Self) void {
+        self.private().closing = true;
+        session.scheduleSave();
+    }
+
+    pub fn isClosing(self: *Self) bool {
+        return self.private().closing;
     }
 
     fn closeConfirmationClose(
         _: *CloseConfirmationDialog,
         self: *Self,
     ) callconv(.c) void {
+        self.markClosing();
         self.as(gtk.Window).destroy();
     }
 
@@ -2455,6 +2608,7 @@ pub const Window = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
+        if (!self.private().closing) session.scheduleSave();
         const view = ext.getAncestor(adw.TabView, surface.as(gtk.Widget)) orelse return;
         const ws = self.workspaceForView(view) orelse return;
         const group = self.findGroup(ws.group_id) orelse return;

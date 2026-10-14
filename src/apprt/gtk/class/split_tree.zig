@@ -16,6 +16,7 @@ const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Application = @import("application.zig").Application;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const Surface = @import("surface.zig").Surface;
+const session = @import("../session.zig");
 const SurfaceScrolledWindow = @import("surface_scrolled_window.zig").SurfaceScrolledWindow;
 
 const log = std.log.scoped(.gtk_ghostty_split_tree);
@@ -496,6 +497,39 @@ pub const SplitTree = extern struct {
 
     /// Set the tree data model that we're showing in this widget. This
     /// will clone the given tree.
+    /// Replace the tree with new terminals laid out like `node`, each
+    /// starting in its saved directory.
+    pub fn restoreTree(self: *Self, node: *const session.Node) Allocator.Error!void {
+        const alloc = Application.default().allocator();
+        var tree = try self.buildSessionTree(alloc, node);
+        defer tree.deinit();
+        self.setTree(&tree);
+    }
+
+    fn buildSessionTree(self: *Self, alloc: Allocator, node: *const session.Node) Allocator.Error!Surface.Tree {
+        if (node.isSplit()) {
+            var left = try self.buildSessionTree(alloc, node.left.?);
+            defer left.deinit();
+            var right = try self.buildSessionTree(alloc, node.right.?);
+            defer right.deinit();
+            const ratio: f16 = @floatCast(std.math.clamp(node.ratio, 0.1, 0.9));
+            return left.split(alloc, .root, if (node.horizontal) .right else .down, ratio, &right);
+        }
+
+        const wd: ?[:0]u8 = if (node.pwd) |p| try alloc.dupeZ(u8, p) else null;
+        defer if (wd) |v| alloc.free(v);
+        const surface: *Surface = .new(.{ .working_directory = wd });
+        defer surface.unref();
+        _ = surface.refSink();
+        _ = self.as(gobject.Object).bindProperty(
+            "is-split",
+            surface.as(gobject.Object),
+            "is-split",
+            .{ .sync_create = true },
+        );
+        return Surface.Tree.init(alloc, surface);
+    }
+
     pub fn setTree(self: *Self, tree_: ?*const Surface.Tree) void {
         const priv = self.private();
 
