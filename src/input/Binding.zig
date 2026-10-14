@@ -578,6 +578,15 @@ pub const Action = union(enum) {
     /// folder. Only supported on Linux (GTK). See `gtk-tab-sidebar`.
     new_tab_group,
 
+    /// Open a sidebar tab (its own row of tabs) in the current sidebar
+    /// group, starting in the group's folder. Linux (GTK) only.
+    new_sidebar_tab,
+
+    /// Show the previous or next tab in the sidebar, across groups,
+    /// wrapping around. Linux (GTK) only.
+    previous_sidebar_tab,
+    next_sidebar_tab,
+
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
 
@@ -1394,6 +1403,9 @@ pub const Action = union(enum) {
             .toggle_tab_overview,
             .toggle_tab_sidebar,
             .new_tab_group,
+            .new_sidebar_tab,
+            .previous_sidebar_tab,
+            .next_sidebar_tab,
             .new_split,
             .goto_split,
             .goto_window,

@@ -3626,6 +3626,11 @@ else
 /// the current tab's folder. Groups can be collapsed, renamed and closed
 /// from the sidebar, and disappear when their last tab closes.
 ///
+/// Each sidebar tab has its own tabs (the tab bar) and splits. Keybind
+/// actions: `new_sidebar_tab` (default `ctrl+alt+n`) and
+/// `previous_sidebar_tab`/`next_sidebar_tab` (default
+/// `ctrl+alt+page_up`/`ctrl+alt+page_down`).
+///
 /// The sidebar can be shown or hidden per window with the
 /// `toggle_tab_sidebar` keybind action (default `ctrl+shift+b`). The tab
 /// bar comes back while the sidebar is hidden.
@@ -6619,6 +6624,21 @@ pub const Keybinds = struct {
                 alloc,
                 .{ .key = .{ .unicode = 'g' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .new_tab_group = {} },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'n' }, .mods = .{ .ctrl = true, .alt = true } },
+                .{ .new_sidebar_tab = {} },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .physical = .page_up }, .mods = .{ .ctrl = true, .alt = true } },
+                .{ .previous_sidebar_tab = {} },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .physical = .page_down }, .mods = .{ .ctrl = true, .alt = true } },
+                .{ .next_sidebar_tab = {} },
             );
             try self.set.put(
                 alloc,

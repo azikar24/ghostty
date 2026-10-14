@@ -889,6 +889,33 @@ pub const Window = extern struct {
         self.newWorkspace(group_id, group.dir);
     }
 
+    /// Open a sidebar tab in the current one's group.
+    pub fn newSidebarTab(self: *Self) void {
+        const ws = self.activeWorkspace() orelse return;
+        self.newWorkspaceInGroup(ws.group_id);
+    }
+
+    /// Show the sidebar tab `delta` rows away in sidebar order (groups in
+    /// order, then their sidebar tabs), wrapping around.
+    pub fn selectSidebarTab(self: *Self, delta: isize) void {
+        const priv = self.private();
+        var order: [256]u32 = undefined;
+        var n: usize = 0;
+        var current: usize = 0;
+        for (priv.groups.items) |group| {
+            for (priv.workspaces.items) |ws| {
+                if (ws.group_id != group.id or n == order.len) continue;
+                if (ws.view == priv.tab_view) current = n;
+                order[n] = ws.id;
+                n += 1;
+            }
+        }
+        if (n < 2) return;
+        const len: isize = @intCast(n);
+        const next: usize = @intCast(@mod(@as(isize, @intCast(current)) + delta, len));
+        self.activateWorkspace(order[next]);
+    }
+
     fn newWorkspace(self: *Self, group_id: u32, dir: ?[:0]const u8) void {
         const id = self.addWorkspace(group_id);
         if (id == 0) return;

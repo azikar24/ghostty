@@ -754,6 +754,9 @@ pub const Application = extern struct {
             .toggle_tab_overview => return Action.toggleTabOverview(target),
             .toggle_tab_sidebar => return Action.toggleTabSidebar(target),
             .new_tab_group => return Action.newTabGroup(target),
+            .new_sidebar_tab => return Action.newSidebarTab(target),
+            .previous_sidebar_tab => return Action.previousSidebarTab(target),
+            .next_sidebar_tab => return Action.nextSidebarTab(target),
             .toggle_window_decorations => return Action.toggleWindowDecorations(target),
             .toggle_command_palette => return Action.toggleCommandPalette(target),
             .toggle_split_zoom => return Action.toggleSplitZoom(target),
@@ -2755,6 +2758,48 @@ const Action = struct {
                 };
 
                 window.newTabGroup();
+                return true;
+            },
+        }
+    }
+
+    pub fn newSidebarTab(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const window = ext.getAncestor(
+                    Window,
+                    core.rt_surface.surface.as(gtk.Widget),
+                ) orelse return false;
+                window.newSidebarTab();
+                return true;
+            },
+        }
+    }
+
+    pub fn previousSidebarTab(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const window = ext.getAncestor(
+                    Window,
+                    core.rt_surface.surface.as(gtk.Widget),
+                ) orelse return false;
+                window.selectSidebarTab(-1);
+                return true;
+            },
+        }
+    }
+
+    pub fn nextSidebarTab(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const window = ext.getAncestor(
+                    Window,
+                    core.rt_surface.surface.as(gtk.Widget),
+                ) orelse return false;
+                window.selectSidebarTab(1);
                 return true;
             },
         }

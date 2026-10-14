@@ -450,6 +450,24 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Open a tab in a new sidebar group in the current folder.",
         }},
 
+        .new_sidebar_tab => comptime &.{.{
+            .action = .new_sidebar_tab,
+            .title = "New Sidebar Tab",
+            .description = "Open a sidebar tab in the current group, in the group's folder.",
+        }},
+
+        .previous_sidebar_tab => comptime &.{.{
+            .action = .previous_sidebar_tab,
+            .title = "Previous Sidebar Tab",
+            .description = "Show the previous tab in the sidebar.",
+        }},
+
+        .next_sidebar_tab => comptime &.{.{
+            .action = .next_sidebar_tab,
+            .title = "Next Sidebar Tab",
+            .description = "Show the next tab in the sidebar.",
+        }},
+
         .prompt_surface_title => comptime &.{.{
             .action = .prompt_surface_title,
             .title = "Change Terminal Title…",
