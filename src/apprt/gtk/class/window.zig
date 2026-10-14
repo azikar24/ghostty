@@ -268,8 +268,16 @@ pub const Window = extern struct {
         /// signals it causes don't queue another rebuild.
         sidebar_rebuilding: bool = false,
 
-        /// Sidebar groups in display order. Tabs refer to them by id.
+        /// Sidebar groups in display order.
         groups: std.ArrayListUnmanaged(SidebarGroup),
+
+        /// Sidebar tabs, each with its own tab view in tab_stack. Kept in
+        /// sidebar order within each group.
+        workspaces: std.ArrayListUnmanaged(Workspace),
+
+        /// The selected sidebar tab's view: what the tab bar, tab overview
+        /// and tab actions (new_tab, goto_tab, ...) operate on.
+        tab_view: *adw.TabView,
 
         /// Group whose rename dialog is open.
         renaming_group: u32 = 0,
@@ -277,9 +285,11 @@ pub const Window = extern struct {
         // Template bindings
         tab_overview: *adw.TabOverview,
         tab_bar: *adw.TabBar,
-        tab_view: *adw.TabView,
+        tab_stack: *gtk.Stack,
+        tab_context_menu: *gio.MenuModel,
         toolbar: *adw.ToolbarView,
         toast_overlay: *adw.ToastOverlay,
+        content_box: *gtk.Box,
         sidebar_paned: *gtk.Paned,
         sidebar_box: *gtk.Box,
         sidebar_rail: *gtk.Box,
@@ -345,6 +355,10 @@ pub const Window = extern struct {
         self.as(gtk.Window).setIconName(build_config.bundle_id);
 
         priv.groups = .empty;
+        priv.workspaces = .empty;
+        const first = self.addWorkspace(self.addGroup(null));
+        if (first == 0) @panic("oom");
+        self.activateWorkspace(first);
 
         // Initialize our actions
         self.initActionMap();
@@ -452,9 +466,6 @@ pub const Window = extern struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
-            /// Sidebar group; zero joins the selected tab's group.
-            group: u32 = 0,
-
             pub const none: @This() = .{};
         },
     ) *adw.TabPage {
@@ -471,16 +482,12 @@ pub const Window = extern struct {
             },
         );
 
-        // Join the requested group, else the selected tab's, else start a
-        // group named after the directory the tab starts in.
-        tab.setGroupId(group: {
-            if (overrides.group != 0) break :group overrides.group;
-            const current = self.selectedGroupId(null);
-            if (current != 0) break :group current;
+        // Name a new group after the directory its first tab starts in.
+        if (self.activeWorkspace()) |ws| if (self.findGroup(ws.group_id)) |group| {
             const dir = overrides.working_directory orelse
                 if (parent_) |p| p.rt_surface.surface.getPwd() else null;
-            break :group self.addGroup(dir);
-        });
+            if (dir) |d| setGroupDir(group, d);
+        };
 
         if (parent_) |p| {
             // For a new window's first tab, inherit the parent's initial size hints.
@@ -710,10 +717,14 @@ pub const Window = extern struct {
     }
 
     //---------------------------------------------------------------
-    // Sidebar groups
+    // Sidebar groups and tabs
+    //
+    // Group -> sidebar tab ("workspace") -> tabs (the tab bar) -> splits.
+    // Each workspace owns an Adw.TabView in tab_stack; priv.tab_view is
+    // the selected workspace's, so the tab bar and all tab actions work
+    // on that workspace's tabs.
 
-    /// A named set of tabs in the sidebar. Every tab belongs to exactly
-    /// one group; a group disappears when its last tab closes.
+    /// A named set of sidebar tabs. Disappears with its last sidebar tab.
     const SidebarGroup = struct {
         id: u32,
         name: [:0]u8,
@@ -729,15 +740,37 @@ pub const Window = extern struct {
         }
     };
 
-    /// Group ids are unique across windows so a tab dragged between
-    /// windows can't land in an unrelated group with the same id.
+    /// A sidebar tab: its own row of tabs. Disappears with its last tab.
+    const Workspace = struct {
+        id: u32,
+        group_id: u32,
+        view: *adw.TabView,
+    };
+
     var next_group_id: u32 = 1;
+    var next_workspace_id: u32 = 1;
 
     /// Do not keep the pointer across anything that can add a group.
     fn findGroup(self: *Self, id: u32) ?*SidebarGroup {
         if (id == 0) return null;
         for (self.private().groups.items) |*g| if (g.id == id) return g;
         return null;
+    }
+
+    /// Do not keep the pointer across anything that can add a workspace.
+    fn findWorkspace(self: *Self, id: u32) ?*Workspace {
+        if (id == 0) return null;
+        for (self.private().workspaces.items) |*ws| if (ws.id == id) return ws;
+        return null;
+    }
+
+    fn workspaceForView(self: *Self, view: *adw.TabView) ?*Workspace {
+        for (self.private().workspaces.items) |*ws| if (ws.view == view) return ws;
+        return null;
+    }
+
+    fn activeWorkspace(self: *Self) ?*Workspace {
+        return self.workspaceForView(self.private().tab_view);
     }
 
     /// Append a group for `dir` and return its id, or zero on OOM.
@@ -752,6 +785,59 @@ pub const Window = extern struct {
         };
         next_group_id += 1;
         return group.id;
+    }
+
+    /// Add an empty sidebar tab at the end of a group and return its id,
+    /// or zero on OOM. The caller adds its first tab.
+    fn addWorkspace(self: *Self, group_id: u32) u32 {
+        if (group_id == 0) return 0;
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        var index = priv.workspaces.items.len;
+        for (priv.workspaces.items, 0..) |ws, i| {
+            if (ws.group_id == group_id) index = i + 1;
+        }
+
+        const view = self.newWorkspaceView();
+        const ws: Workspace = .{ .id = next_workspace_id, .group_id = group_id, .view = view };
+        priv.workspaces.insert(alloc, index, ws) catch {
+            priv.tab_stack.remove(view.as(gtk.Widget));
+            return 0;
+        };
+        next_workspace_id += 1;
+        return ws.id;
+    }
+
+    /// A tab view wired up the way the template used to wire the single one.
+    fn newWorkspaceView(self: *Self) *adw.TabView {
+        const priv = self.private();
+        const view = adw.TabView.new();
+        view.setShortcuts(.{});
+        view.setMenuModel(priv.tab_context_menu);
+        _ = gobject.Object.signals.notify.connect(view, *Self, tabViewNPages, self, .{ .detail = "n-pages" });
+        _ = gobject.Object.signals.notify.connect(view, *Self, tabViewSelectedPage, self, .{ .detail = "selected-page" });
+        _ = adw.TabView.signals.close_page.connect(view, *Self, tabViewClosePage, self, .{});
+        _ = adw.TabView.signals.page_attached.connect(view, *Self, tabViewPageAttached, self, .{});
+        _ = adw.TabView.signals.page_detached.connect(view, *Self, tabViewPageDetached, self, .{});
+        _ = adw.TabView.signals.page_reordered.connect(view, *Self, tabViewPageReordered, self, .{});
+        _ = adw.TabView.signals.create_window.connect(view, *Self, tabViewCreateWindow, self, .{});
+        _ = adw.TabView.signals.setup_menu.connect(view, *Self, setupTabMenu, self, .{});
+        _ = priv.tab_stack.addChild(view.as(gtk.Widget));
+        return view;
+    }
+
+    /// Show a sidebar tab: its tabs go in the tab bar and the content.
+    fn activateWorkspace(self: *Self, id: u32) void {
+        const priv = self.private();
+        const ws = self.findWorkspace(id) orelse return;
+        priv.tab_view = ws.view;
+        priv.tab_stack.setVisibleChild(ws.view.as(gtk.Widget));
+        priv.tab_bar.setView(ws.view);
+        priv.tab_overview.setView(ws.view);
+        self.syncSelectedTab();
+        self.scheduleSidebarRebuild();
+        self.focusActiveSurface();
     }
 
     fn setGroupDir(group: *SidebarGroup, dir: []const u8) void {
@@ -775,52 +861,45 @@ pub const Window = extern struct {
         return alloc.dupeZ(u8, if (base.len == 0) "/" else base);
     }
 
-    /// The selected tab's group, ignoring `except` (a tab being attached
-    /// may already be the selected page). Zero if none.
-    fn selectedGroupId(self: *Self, except: ?*Tab) u32 {
-        const tab = self.getSelectedTab() orelse return 0;
-        if (tab == except) return 0;
-        const id = tab.getGroupId();
-        return if (self.findGroup(id) != null) id else 0;
-    }
-
-    fn groupTabCount(self: *Self, id: u32) usize {
-        const tab_view = self.private().tab_view;
+    fn groupWorkspaceCount(self: *Self, id: u32) usize {
         var count: usize = 0;
-        for (0..@intCast(tab_view.getNPages())) |i| {
-            if (pageGroupId(tab_view.getNthPage(@intCast(i))) == id) count += 1;
+        for (self.private().workspaces.items) |ws| {
+            if (ws.group_id == id) count += 1;
         }
         return count;
     }
 
-    /// Open a tab in a new group that starts in the current tab's folder.
+    /// Open a sidebar tab in a new group that starts in the current
+    /// tab's folder.
     pub fn newTabGroup(self: *Self) void {
         const dir: ?[:0]const u8 = if (self.getActiveSurface()) |s| s.getPwd() else null;
-        const id = self.addGroup(dir);
+        self.newWorkspace(self.addGroup(dir), dir);
+    }
+
+    /// Open a sidebar tab at the end of a group, in the group's folder.
+    pub fn newWorkspaceInGroup(self: *Self, group_id: u32) void {
+        const group = self.findGroup(group_id) orelse return;
+        group.collapsed = false;
+        self.newWorkspace(group_id, group.dir);
+    }
+
+    fn newWorkspace(self: *Self, group_id: u32, dir: ?[:0]const u8) void {
+        const id = self.addWorkspace(group_id);
         if (id == 0) return;
-        _ = self.newTabPage(null, .tab, .{ .working_directory = dir, .group = id });
+        self.activateWorkspace(id);
+        _ = self.newTabPage(null, .tab, .{ .working_directory = dir });
         self.focusActiveSurface();
     }
 
-    /// Open a tab at the end of a group, in the group's folder.
-    pub fn newTabInGroup(self: *Self, id: u32) void {
-        const group = self.findGroup(id) orelse return;
-        group.collapsed = false;
-        const page = self.newTabPage(null, .tab, .{ .working_directory = group.dir, .group = id });
-
-        // New tabs go after the selected tab, which may be in another
-        // group; move it behind the group's other tabs.
-        const tab_view = self.private().tab_view;
-        var last: ?usize = null;
-        for (0..@intCast(tab_view.getNPages())) |i| {
-            const other = tab_view.getNthPage(@intCast(i));
-            if (other != page and pageGroupId(other) == id) last = i;
+    fn closeWorkspace(self: *Self, id: u32) void {
+        const ws = self.findWorkspace(id) orelse return;
+        const view = ws.view;
+        // Backwards, since pages may be removed as we go.
+        var i = view.getNPages();
+        while (i > 0) {
+            i -= 1;
+            view.closePage(view.getNthPage(i));
         }
-        if (last) |l| {
-            const pos: usize = @intCast(tab_view.getPagePosition(page));
-            _ = tab_view.reorderPage(page, @intCast(if (pos > l) l + 1 else l));
-        }
-        self.focusActiveSurface();
     }
 
     fn focusActiveSurface(self: *Self) void {
@@ -834,7 +913,6 @@ pub const Window = extern struct {
     fn scheduleSidebarRebuild(self: *Self) void {
         const priv = self.private();
         if (priv.sidebar_rebuild != null or priv.sidebar_rebuilding) return;
-        if (!self.sidebarShown()) return;
         priv.sidebar_rebuild = glib.idleAdd(sidebarRebuildIdle, self);
     }
 
@@ -844,20 +922,51 @@ pub const Window = extern struct {
         priv.sidebar_rebuild = null;
         priv.sidebar_rebuilding = true;
         defer priv.sidebar_rebuilding = false;
-        self.rebuildSidebar();
+        self.pruneWorkspaces();
+        if (self.sidebarShown()) self.rebuildSidebar();
         return 0;
     }
 
-    /// Select the row of the selected tab without rebuilding, so open
-    /// menus and hover state survive tab switches.
+    /// Drop sidebar tabs whose tabs have all closed, and then empty groups.
+    /// Runs on idle: a view can't be destroyed inside its own signals.
+    fn pruneWorkspaces(self: *Self) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        var i: usize = 0;
+        while (i < priv.workspaces.items.len) {
+            const ws = priv.workspaces.items[i];
+            if (ws.view.getNPages() > 0 or priv.workspaces.items.len == 1) {
+                i += 1;
+                continue;
+            }
+            _ = priv.workspaces.orderedRemove(i);
+            if (ws.view == priv.tab_view) {
+                const next = priv.workspaces.items[@min(i, priv.workspaces.items.len - 1)];
+                self.activateWorkspace(next.id);
+            }
+            priv.tab_stack.remove(ws.view.as(gtk.Widget));
+        }
+
+        var gi: usize = 0;
+        while (gi < priv.groups.items.len) {
+            if (self.groupWorkspaceCount(priv.groups.items[gi].id) == 0) {
+                var group = priv.groups.orderedRemove(gi);
+                group.deinit(alloc);
+            } else gi += 1;
+        }
+    }
+
+    /// Select the active sidebar tab's row without rebuilding, so open
+    /// menus and hover state survive.
     fn syncSidebarSelection(self: *Self) void {
         if (!self.sidebarShown()) return;
         const priv = self.private();
-        const page = priv.tab_view.getSelectedPage() orelse return;
+        const ws = self.activeWorkspace() orelse return;
         var i: c_int = 0;
         while (priv.sidebar_list.getRowAtIndex(i)) |row| : (i += 1) {
-            const raw = row.as(gobject.Object).getData("ghostty-page") orelse continue;
-            if (@intFromPtr(raw) != @intFromPtr(page)) continue;
+            const raw = row.as(gobject.Object).getData("ghostty-workspace") orelse continue;
+            if (@intFromPtr(raw) != ws.id) continue;
             priv.sidebar_list.selectRow(row);
             return;
         }
@@ -867,46 +976,17 @@ pub const Window = extern struct {
 
     fn rebuildSidebar(self: *Self) void {
         const priv = self.private();
-        const tab_view = priv.tab_view;
-        const alloc = Application.default().allocator();
-        const n: usize = @intCast(tab_view.getNPages());
-
-        // Drop groups whose tabs have all closed.
-        var gi: usize = 0;
-        while (gi < priv.groups.items.len) {
-            if (self.groupTabCount(priv.groups.items[gi].id) == 0) {
-                var group = priv.groups.orderedRemove(gi);
-                group.deinit(alloc);
-            } else gi += 1;
-        }
-
-        // Keep tab order equal to sidebar order (groups in order, tabs in
-        // their relative order) so next_tab and goto_tab follow the sidebar.
-        var pos: usize = 0;
-        for (priv.groups.items) |group| {
-            for (pos..n) |i| {
-                const page = tab_view.getNthPage(@intCast(i));
-                if (pageGroupId(page) != group.id) continue;
-                if (i != pos) _ = tab_view.reorderPage(page, @intCast(pos));
-                pos += 1;
-            }
-        }
-
         const list = priv.sidebar_list;
         list.removeAll();
-        const selected = tab_view.getSelectedPage();
-        var i: usize = 0;
         for (priv.groups.items) |*group| {
-            const count = self.groupTabCount(group.id);
-            list.append(sidebarGroupRow(group, count).as(gtk.Widget));
-            for (0..count) |_| {
-                const page = tab_view.getNthPage(@intCast(i));
-                i += 1;
-                const is_selected = selected == page;
-                if (group.collapsed and !is_selected) continue;
-                const row = self.sidebarTabRow(page);
+            list.append(sidebarGroupRow(group, self.groupWorkspaceCount(group.id)).as(gtk.Widget));
+            for (priv.workspaces.items) |ws| {
+                if (ws.group_id != group.id) continue;
+                const active = ws.view == priv.tab_view;
+                if (group.collapsed and !active) continue;
+                const row = self.sidebarWorkspaceRow(ws);
                 list.append(row.as(gtk.Widget));
-                if (is_selected) list.selectRow(row);
+                if (active) list.selectRow(row);
             }
         }
     }
@@ -933,8 +1013,8 @@ pub const Window = extern struct {
         const name = gtk.Label.new(group.name.ptr);
         name.setXalign(0);
         name.setEllipsize(.end);
-        name.as(gtk.Widget).setHexpand(1);
         name.setWidthChars(6);
+        name.as(gtk.Widget).setHexpand(1);
         name.as(gtk.Widget).addCssClass("group-name");
         box.append(name.as(gtk.Widget));
 
@@ -981,10 +1061,10 @@ pub const Window = extern struct {
         return row;
     }
 
-    fn sidebarTabRow(self: *Self, page: *adw.TabPage) *gtk.ListBoxRow {
+    fn sidebarWorkspaceRow(self: *Self, ws: Workspace) *gtk.ListBoxRow {
         const row = gtk.ListBoxRow.new();
         row.as(gtk.Widget).addCssClass("sidebar-tab");
-        row.as(gobject.Object).setData("ghostty-page", page);
+        row.as(gobject.Object).setData("ghostty-workspace", @ptrFromInt(ws.id));
 
         const box = gtk.Box.new(.horizontal, 6);
 
@@ -994,30 +1074,50 @@ pub const Window = extern struct {
         dot.as(gtk.Widget).setValign(.center);
         box.append(dot.as(gtk.Widget));
 
-        // Bound rather than rebuilt: shells retitle the tab on every command.
+        // Named after its selected tab. Bound rather than rebuilt: shells
+        // retitle the tab on every command.
         const title = gtk.Label.new(null);
         title.as(gtk.Widget).addCssClass("tab-title");
         title.setXalign(0);
         title.setEllipsize(.end);
         title.as(gtk.Widget).setHexpand(1);
-        _ = page.as(gobject.Object).bindProperty("title", title.as(gobject.Object), "label", .{ .sync_create = true });
-        _ = page.as(gobject.Object).bindProperty("tooltip", row.as(gobject.Object), "tooltip-markup", .{ .sync_create = true });
+        if (ws.view.getSelectedPage()) |page| {
+            _ = page.as(gobject.Object).bindProperty("title", title.as(gobject.Object), "label", .{ .sync_create = true });
+            _ = page.as(gobject.Object).bindProperty("tooltip", row.as(gobject.Object), "tooltip-markup", .{ .sync_create = true });
+        }
         box.append(title.as(gtk.Widget));
 
-        const bell = gtk.Image.newFromIconName("media-record-symbolic");
-        bell.as(gtk.Widget).addCssClass("attention");
-        bell.as(gtk.Widget).setValign(.center);
-        _ = page.as(gobject.Object).bindProperty("needs-attention", bell.as(gobject.Object), "visible", .{ .sync_create = true });
-        box.append(bell.as(gtk.Widget));
+        // Bell in a background tab.
+        const n: usize = @intCast(ws.view.getNPages());
+        var attention = false;
+        for (0..n) |i| {
+            if (ws.view.getNthPage(@intCast(i)).getNeedsAttention() != 0) attention = true;
+        }
+        if (attention) {
+            const bell = gtk.Image.newFromIconName("media-record-symbolic");
+            bell.as(gtk.Widget).addCssClass("attention");
+            bell.as(gtk.Widget).setValign(.center);
+            box.append(bell.as(gtk.Widget));
+        }
+
+        // How many tabs it holds, when more than one.
+        if (n > 1) {
+            var buf: [32]u8 = undefined;
+            const count = gtk.Label.new((std.fmt.bufPrintZ(&buf, "{d}", .{n}) catch "").ptr);
+            count.as(gtk.Widget).addCssClass("tab-count");
+            count.as(gtk.Widget).addCssClass("dim-label");
+            count.as(gtk.Widget).setValign(.center);
+            box.append(count.as(gtk.Widget));
+        }
 
         const close = gtk.Button.newFromIconName("window-close-symbolic");
         close.as(gtk.Widget).addCssClass("flat");
         close.as(gtk.Widget).addCssClass("circular");
         close.as(gtk.Widget).addCssClass("close");
         close.as(gtk.Widget).setValign(.center);
-        close.as(gtk.Widget).setTooltipText(i18n._("Close Tab"));
+        close.as(gtk.Widget).setTooltipText(i18n._("Close All Its Tabs"));
         close.as(gtk.Widget).setFocusOnClick(0);
-        close.as(gobject.Object).setData("ghostty-page", page);
+        close.as(gobject.Object).setData("ghostty-workspace", @ptrFromInt(ws.id));
         _ = gtk.Button.signals.clicked.connect(
             close,
             *Self,
@@ -1029,19 +1129,6 @@ pub const Window = extern struct {
 
         row.setChild(box.as(gtk.Widget));
         return row;
-    }
-
-    /// The page stored on a sidebar widget, if it is still in this window.
-    /// Rows can outlive their page until the next idle rebuild, so the
-    /// pointer is only compared, never dereferenced, until it's found.
-    fn sidebarPage(self: *Self, obj: *gobject.Object) ?*adw.TabPage {
-        const raw = obj.getData("ghostty-page") orelse return null;
-        const tab_view = self.private().tab_view;
-        for (0..@intCast(tab_view.getNPages())) |i| {
-            const page = tab_view.getNthPage(@intCast(i));
-            if (@intFromPtr(page) == @intFromPtr(raw)) return page;
-        }
-        return null;
     }
 
     fn sidebarRowActivated(
@@ -1059,14 +1146,13 @@ pub const Window = extern struct {
             return;
         }
 
-        const page = self.sidebarPage(obj) orelse return;
-        self.private().tab_view.setSelectedPage(page);
-        self.focusActiveSurface();
+        const raw = obj.getData("ghostty-workspace") orelse return;
+        self.activateWorkspace(@intCast(@intFromPtr(raw)));
     }
 
     fn sidebarCloseClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        const page = self.sidebarPage(button.as(gobject.Object)) orelse return;
-        self.private().tab_view.closePage(page);
+        const raw = button.as(gobject.Object).getData("ghostty-workspace") orelse return;
+        self.closeWorkspace(@intCast(@intFromPtr(raw)));
     }
 
     fn actionNewGroup(_: *gio.SimpleAction, _: ?*glib.Variant, self: *Self) callconv(.c) void {
@@ -1074,7 +1160,7 @@ pub const Window = extern struct {
     }
 
     fn actionGroupNewTab(_: *gio.SimpleAction, param: ?*glib.Variant, self: *Self) callconv(.c) void {
-        self.newTabInGroup((param orelse return).getUint32());
+        self.newWorkspaceInGroup((param orelse return).getUint32());
     }
 
     fn actionGroupRename(_: *gio.SimpleAction, param: ?*glib.Variant, self: *Self) callconv(.c) void {
@@ -1103,23 +1189,17 @@ pub const Window = extern struct {
 
     fn actionGroupClose(_: *gio.SimpleAction, param: ?*glib.Variant, self: *Self) callconv(.c) void {
         const id = (param orelse return).getUint32();
-        const tab_view = self.private().tab_view;
-        // Backwards, since pages may be removed as we go.
-        var i = tab_view.getNPages();
-        while (i > 0) {
-            i -= 1;
-            const page = tab_view.getNthPage(i);
-            if (pageGroupId(page) == id) tab_view.closePage(page);
+        // Copy the ids first: closing can't change the list synchronously
+        // (pruning is on idle) but don't rely on it.
+        var ids: [256]u32 = undefined;
+        var n: usize = 0;
+        for (self.private().workspaces.items) |ws| {
+            if (ws.group_id == id and n < ids.len) {
+                ids[n] = ws.id;
+                n += 1;
+            }
         }
-    }
-
-    fn pageTab(page: *adw.TabPage) ?*Tab {
-        return gobject.ext.cast(Tab, page.getChild());
-    }
-
-    fn pageGroupId(page: *adw.TabPage) u32 {
-        const tab = pageTab(page) orelse return 0;
-        return tab.getGroupId();
+        for (ids[0..n]) |ws_id| self.closeWorkspace(ws_id);
     }
 
     /// `dir` with $HOME shortened to `~`, written to buf.
@@ -1225,12 +1305,15 @@ pub const Window = extern struct {
                 config.@"window-theme" == .ghostty,
         );
 
-        // Move the tab bar to the proper location.
-        priv.toolbar.remove(priv.tab_bar.as(gtk.Widget));
-        switch (config.@"gtk-tabs-location") {
-            .top => priv.toolbar.addTopBar(priv.tab_bar.as(gtk.Widget)),
-            .bottom => priv.toolbar.addBottomBar(priv.tab_bar.as(gtk.Widget)),
-        }
+        // Move the tab bar to the proper location: it lives in the content
+        // column, next to the sidebar rather than above it.
+        priv.content_box.reorderChildAfter(
+            priv.tab_bar.as(gtk.Widget),
+            switch (config.@"gtk-tabs-location") {
+                .top => null,
+                .bottom => priv.toast_overlay.as(gtk.Widget),
+            },
+        );
 
         self.syncSidebar();
 
@@ -1464,6 +1547,8 @@ pub const Window = extern struct {
     /// Get the currently selected tab as a Tab object.
     fn getSelectedTab(self: *Self) ?*Tab {
         const priv = self.private();
+        // Template bindings ask before init creates the first tab view.
+        if (priv.workspaces.items.len == 0) return null;
         const page = priv.tab_view.getSelectedPage() orelse return null;
         const child = page.getChild();
         assert(gobject.ext.isA(child, Tab));
@@ -1473,11 +1558,18 @@ pub const Window = extern struct {
     /// Returns true if this window needs confirmation before quitting.
     fn getNeedsConfirmQuit(self: *Self) bool {
         const priv = self.private();
-        const n = priv.tab_view.getNPages();
+        for (priv.workspaces.items) |ws| {
+            if (viewNeedsConfirmQuit(ws.view)) return true;
+        }
+        return false;
+    }
+
+    fn viewNeedsConfirmQuit(view: *adw.TabView) bool {
+        const n = view.getNPages();
         assert(n >= 0);
 
         for (0..@intCast(n)) |i| {
-            const page = priv.tab_view.getNthPage(@intCast(i));
+            const page = view.getNthPage(@intCast(i));
             const child = page.getChild();
             const tab = gobject.ext.cast(Tab, child) orelse {
                 log.warn("unexpected non-Tab child in tab view", .{});
@@ -1566,7 +1658,6 @@ pub const Window = extern struct {
                 return true;
             },
             .native => {
-                if (self.sidebarShown() or self.sidebarRailShown()) return false;
                 return switch (config.@"window-show-tab-bar") {
                     .always, .auto => true,
                     .never => false,
@@ -1801,6 +1892,7 @@ pub const Window = extern struct {
         const alloc = Application.default().allocator();
         for (priv.groups.items) |*g| g.deinit(alloc);
         priv.groups.deinit(alloc);
+        priv.workspaces.deinit(alloc);
         priv.tab_bindings.unref();
         priv.winproto.deinit(Application.default().allocator());
 
@@ -1972,11 +2064,11 @@ pub const Window = extern struct {
     }
 
     fn tabViewClosePage(
-        _: *adw.TabView,
+        view: *adw.TabView,
         page: *adw.TabPage,
         self: *Self,
     ) callconv(.c) c_int {
-        const priv = self.private();
+        _ = self;
         const child = page.getChild();
         const tab = gobject.ext.cast(Tab, child) orelse
             return @intFromBool(false);
@@ -1984,7 +2076,7 @@ pub const Window = extern struct {
         // If the tab says it doesn't need confirmation then we go ahead
         // and close immediately.
         if (!tab.getNeedsConfirmQuit()) {
-            priv.tab_view.closePageFinish(page, @intFromBool(true));
+            view.closePageFinish(page, @intFromBool(true));
             return @intFromBool(true);
         }
 
@@ -2011,11 +2103,19 @@ pub const Window = extern struct {
     }
 
     fn tabViewSelectedPage(
-        _: *adw.TabView,
+        view: *adw.TabView,
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
+        // Sidebar rows are named after their view's selected tab.
+        self.scheduleSidebarRebuild();
+        if (view == self.private().tab_view) self.syncSelectedTab();
+    }
+
+    /// Sync window state from the selected tab of the active view.
+    fn syncSelectedTab(self: *Self) void {
         const priv = self.private();
+        defer self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
 
         // Always reset our binding source in case we have no pages.
         priv.tab_bindings.setSource(null);
@@ -2032,8 +2132,6 @@ pub const Window = extern struct {
         // If the tab was previously marked as needing attention
         // (e.g. due to a bell character), we now unmark that
         page.setNeedsAttention(@intFromBool(false));
-
-        self.syncSidebarSelection();
     }
 
     fn tabViewPageReordered(
@@ -2045,14 +2143,23 @@ pub const Window = extern struct {
         self.scheduleSidebarRebuild();
     }
 
+    fn pageSidebarPropChanged(
+        _: *adw.TabPage,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        self.scheduleSidebarRebuild();
+    }
+
     /// Name a group that started before its shell reported a directory.
     fn surfacePwdChanged(
         surface: *Surface,
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
-        const tab = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse return;
-        const group = self.findGroup(tab.getGroupId()) orelse return;
+        const view = ext.getAncestor(adw.TabView, surface.as(gtk.Widget)) orelse return;
+        const ws = self.workspaceForView(view) orelse return;
+        const group = self.findGroup(ws.group_id) orelse return;
         if (group.dir != null) return;
         const pwd = surface.getPwd() orelse return;
         setGroupDir(group, pwd);
@@ -2101,13 +2208,14 @@ pub const Window = extern struct {
             self.connectSurfaceHandlers(tree);
         }
 
-        // Tabs from another window (dragged in) join the selected tab's
-        // group, or start one of their own.
-        if (self.findGroup(tab.getGroupId()) == null) {
-            const current = self.selectedGroupId(tab);
-            const dir = if (tab.getActiveSurface()) |s| s.getPwd() else null;
-            tab.setGroupId(if (current != 0) current else self.addGroup(dir));
-        }
+        // A background tab's bell shows on its sidebar row.
+        _ = gobject.Object.signals.notify.connect(
+            page,
+            *Self,
+            pageSidebarPropChanged,
+            self,
+            .{ .detail = "needs-attention" },
+        );
         self.scheduleSidebarRebuild();
     }
 
@@ -2151,7 +2259,7 @@ pub const Window = extern struct {
     fn tabViewCreateWindow(
         _: *adw.TabView,
         _: *Self,
-    ) callconv(.c) *adw.TabView {
+    ) callconv(.c) ?*adw.TabView {
         // Create a new window without creating a new tab.
         const win = gobject.ext.newInstance(
             Self,
@@ -2171,19 +2279,33 @@ pub const Window = extern struct {
         tab: *Tab,
         self: *Self,
     ) callconv(.c) void {
-        const priv = self.private();
-        const page = priv.tab_view.getPage(tab.as(gtk.Widget));
+        _ = self;
+        // The tab's own view: it may be in a sidebar tab that isn't shown.
+        const view = ext.getAncestor(adw.TabView, tab.as(gtk.Widget)) orelse return;
         // TODO: connect close page handler to tab to check for confirmation
-        priv.tab_view.closePage(page);
+        view.closePage(view.getPage(tab.as(gtk.Widget)));
     }
 
     fn tabViewNPages(
-        _: *adw.TabView,
+        view: *adw.TabView,
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
-        if (priv.tab_view.getNPages() == 0) {
+        // Counts on sidebar rows; empty sidebar tabs are pruned on idle.
+        self.scheduleSidebarRebuild();
+        if (view.getNPages() != 0) return;
+
+        // Another sidebar tab still has tabs: show it instead of closing.
+        if (view == priv.tab_view) {
+            for (priv.workspaces.items) |ws| {
+                if (ws.view.getNPages() == 0) continue;
+                self.activateWorkspace(ws.id);
+                return;
+            }
+        } else return;
+
+        {
             // If we have no pages left then we want to close window.
 
             // If the tab overview is open, then we don't close the window
@@ -2267,9 +2389,12 @@ pub const Window = extern struct {
             return;
         };
 
-        // Get the page that contains this tab
+        // Get the page that contains this tab, showing its sidebar tab.
         const priv = self.private();
-        const tab_view = priv.tab_view;
+        const tab_view = ext.getAncestor(adw.TabView, tab.as(gtk.Widget)) orelse priv.tab_view;
+        if (self.workspaceForView(tab_view)) |ws| {
+            if (tab_view != priv.tab_view) self.activateWorkspace(ws.id);
+        }
         const page = tab_view.getPage(tab.as(gtk.Widget));
         tab_view.setSelectedPage(page);
 
@@ -2687,13 +2812,15 @@ pub const Window = extern struct {
             // Bindings
             class.bindTemplateChildPrivate("tab_overview", .{});
             class.bindTemplateChildPrivate("tab_bar", .{});
-            class.bindTemplateChildPrivate("tab_view", .{});
+            class.bindTemplateChildPrivate("tab_stack", .{});
+            class.bindTemplateChildPrivate("tab_context_menu", .{});
             class.bindTemplateChildPrivate("sidebar_paned", .{});
             class.bindTemplateChildPrivate("sidebar_box", .{});
             class.bindTemplateChildPrivate("sidebar_rail", .{});
             class.bindTemplateChildPrivate("sidebar_list", .{});
             class.bindTemplateChildPrivate("toolbar", .{});
             class.bindTemplateChildPrivate("toast_overlay", .{});
+            class.bindTemplateChildPrivate("content_box", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("realize", &windowRealize);
@@ -2701,16 +2828,8 @@ pub const Window = extern struct {
             class.bindTemplateCallback("overview_create_tab", &tabOverviewCreateTab);
             class.bindTemplateCallback("overview_notify_open", &tabOverviewOpen);
             class.bindTemplateCallback("close_request", &windowCloseRequest);
-            class.bindTemplateCallback("close_page", &tabViewClosePage);
-            class.bindTemplateCallback("page_attached", &tabViewPageAttached);
-            class.bindTemplateCallback("page_detached", &tabViewPageDetached);
-            class.bindTemplateCallback("page_reordered", &tabViewPageReordered);
             class.bindTemplateCallback("sidebar_row_activated", &sidebarRowActivated);
             class.bindTemplateCallback("sidebar_paned_position", &sidebarPanedPosition);
-            class.bindTemplateCallback("setup_tab_menu", &setupTabMenu);
-            class.bindTemplateCallback("tab_create_window", &tabViewCreateWindow);
-            class.bindTemplateCallback("notify_n_pages", &tabViewNPages);
-            class.bindTemplateCallback("notify_selected_page", &tabViewSelectedPage);
             class.bindTemplateCallback("notify_config", &propConfig);
             class.bindTemplateCallback("notify_fullscreened", &propFullscreened);
             class.bindTemplateCallback("notify_is_active", &propIsActive);

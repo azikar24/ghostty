@@ -168,10 +168,6 @@ pub const Tab = extern struct {
         /// The tooltip of this tab. This is usually bound to the active surface.
         tooltip: ?[:0]const u8 = null,
 
-        /// The sidebar group (owned by the window) this tab belongs to.
-        /// Zero means none yet.
-        group_id: u32 = 0,
-
         // Template bindings
         split_tree: *SplitTree,
 
@@ -290,14 +286,6 @@ pub const Tab = extern struct {
     /// This does not ref the value.
     pub fn getActiveSurface(self: *Self) ?*Surface {
         return self.getSplitTree().getActiveSurface();
-    }
-
-    pub fn getGroupId(self: *Self) u32 {
-        return self.private().group_id;
-    }
-
-    pub fn setGroupId(self: *Self, id: u32) void {
-        self.private().group_id = id;
     }
 
     /// Get the surface tree of this tab.

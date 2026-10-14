@@ -210,6 +210,10 @@ label.resize-overlay {
   padding: 0;
 }
 
+.tab-sidebar row.sidebar-tab label.tab-count {
+  font-size: smaller;
+}
+
 .tab-sidebar row.sidebar-group .hover-only {
   opacity: 0;
 }
