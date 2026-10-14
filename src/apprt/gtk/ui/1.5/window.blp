@@ -149,19 +149,103 @@ template $GhosttyWindow: Adw.ApplicationWindow {
 
       // Tab sidebar (gtk-tab-sidebar). Rows are built in code, see
       // rebuildSidebar in window.zig.
-      Adw.OverlaySplitView sidebar_split {
-        collapsed: false;
-        show-sidebar: false;
-        min-sidebar-width: 220;
-        max-sidebar-width: 320;
-        sidebar-width-fraction: 0.22;
+      Gtk.Box {
+        orientation: horizontal;
 
-        sidebar: Gtk.Box {
+        // Collapsed sidebar: a thin strip to bring it back.
+        Gtk.Box sidebar_rail {
+          styles [
+            "tab-sidebar-rail",
+          ]
+
+          orientation: vertical;
+          spacing: 4;
+          visible: false;
+
+          Gtk.Button {
+            styles [
+              "flat",
+            ]
+
+            icon-name: "sidebar-show-symbolic";
+            action-name: "win.toggle-tab-sidebar";
+            tooltip-text: _("Show Sidebar (Ctrl+Shift+B)");
+            can-focus: false;
+            focus-on-click: false;
+          }
+
+          Gtk.Button {
+            styles [
+              "flat",
+            ]
+
+            icon-name: "tab-new-symbolic";
+            action-name: "win.new-tab";
+            tooltip-text: _("New Tab");
+            can-focus: false;
+            focus-on-click: false;
+          }
+
+          Gtk.Button {
+            styles [
+              "flat",
+            ]
+
+            icon-name: "folder-new-symbolic";
+            action-name: "win.new-group";
+            tooltip-text: _("New Group (Ctrl+Shift+G)");
+            can-focus: false;
+            focus-on-click: false;
+          }
+        }
+
+        Gtk.Paned sidebar_paned {
+          orientation: horizontal;
+          hexpand: true;
+          resize-start-child: false;
+          shrink-start-child: false;
+          shrink-end-child: false;
+          notify::position => $sidebar_paned_position();
+
+          start-child: Gtk.Box sidebar_box {
           styles [
             "tab-sidebar",
           ]
 
           orientation: vertical;
+          width-request: 180;
+          visible: false;
+
+          Gtk.Box {
+            styles [
+              "tab-sidebar-header",
+            ]
+
+            orientation: horizontal;
+
+            Gtk.Label {
+              styles [
+                "dim-label",
+                "caption-heading",
+              ]
+
+              label: _("TABS");
+              xalign: 0;
+              hexpand: true;
+            }
+
+            Gtk.Button {
+              styles [
+                "flat",
+              ]
+
+              icon-name: "sidebar-show-symbolic";
+              action-name: "win.toggle-tab-sidebar";
+              tooltip-text: _("Collapse Sidebar (Ctrl+Shift+B)");
+              can-focus: false;
+              focus-on-click: false;
+            }
+          }
 
           Gtk.ScrolledWindow {
             hscrollbar-policy: never;
@@ -197,7 +281,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
           }
         };
 
-        content: Box {
+        end-child: Box {
           orientation: vertical;
 
           $GhosttyDebugWarning {
@@ -219,6 +303,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
             }
           }
         };
+        }
       }
     }
   };

@@ -222,11 +222,44 @@ label.resize-overlay {
 
 .tab-sidebar row.sidebar-tab {
   min-height: 28px;
-  padding: 2px 4px 2px 32px;
+  padding: 2px 4px 2px 18px;
 }
 
+/* Active tab: accent dot and bold title, no background. */
 .tab-sidebar row.sidebar-tab:selected {
-  box-shadow: inset 3px 0 0 0 var(--accent-bg-color);
+  background: none;
+}
+
+.tab-sidebar row.sidebar-tab:selected:hover {
+  background-color: alpha(currentColor, 0.05);
+}
+
+.tab-sidebar row.sidebar-tab image.active-dot {
+  -gtk-icon-size: 8px;
+  color: var(--accent-color);
+  opacity: 0;
+}
+
+.tab-sidebar row.sidebar-tab:selected image.active-dot {
+  opacity: 1;
+}
+
+.tab-sidebar row.sidebar-tab label.tab-title {
+  opacity: 0.75;
+}
+
+.tab-sidebar row.sidebar-tab:selected label.tab-title {
+  font-weight: 700;
+  opacity: 1;
+}
+
+.tab-sidebar .tab-sidebar-header {
+  padding: 6px 4px 0 12px;
+}
+
+.tab-sidebar-rail {
+  padding: 6px 4px;
+  border-right: 1px solid alpha(currentColor, 0.1);
 }
 
 .tab-sidebar row.sidebar-tab button.close {
@@ -242,7 +275,7 @@ label.resize-overlay {
 }
 
 .tab-sidebar row.sidebar-tab image.attention {
-  color: var(--accent-color);
+  color: var(--warning-color);
   -gtk-icon-size: 8px;
 }
 

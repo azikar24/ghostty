@@ -280,7 +280,9 @@ pub const Window = extern struct {
         tab_view: *adw.TabView,
         toolbar: *adw.ToolbarView,
         toast_overlay: *adw.ToastOverlay,
-        sidebar_split: *adw.OverlaySplitView,
+        sidebar_paned: *gtk.Paned,
+        sidebar_box: *gtk.Box,
+        sidebar_rail: *gtk.Box,
         sidebar_list: *gtk.ListBox,
 
         pub var offset: c_int = 0;
@@ -399,6 +401,7 @@ pub const Window = extern struct {
             .init("toggle-command-palette", actionToggleCommandPalette, null),
             .init("toggle-inspector", actionToggleInspector, null),
             .init("new-group", actionNewGroup, null),
+            .init("toggle-tab-sidebar", actionToggleTabSidebar, null),
             .init("group-new-tab", actionGroupNewTab, u_variant_type),
             .init("group-rename", actionGroupRename, u_variant_type),
             .init("group-close", actionGroupClose, u_variant_type),
@@ -668,12 +671,42 @@ pub const Window = extern struct {
         return config.@"gtk-tab-sidebar" != priv.sidebar_toggled;
     }
 
+    /// Collapsed: the sidebar is enabled in the config but folded into
+    /// the rail. When the config disables it, the tab bar is used instead.
+    fn sidebarRailShown(self: *Self) bool {
+        const priv = self.private();
+        const config = if (priv.config) |v| v.get() else return false;
+        return self.sidebarAllowed() and config.@"gtk-tab-sidebar" and !self.sidebarShown();
+    }
+
+    /// Sidebar width shared by all windows, so a resize sticks.
+    var sidebar_width: c_int = 240;
+
     fn syncSidebar(self: *Self) void {
         const priv = self.private();
         const shown = self.sidebarShown();
-        priv.sidebar_split.setShowSidebar(@intFromBool(shown));
+        if (shown) priv.sidebar_paned.setPosition(sidebar_width);
+        priv.sidebar_box.as(gtk.Widget).setVisible(@intFromBool(shown));
+        priv.sidebar_rail.as(gtk.Widget).setVisible(@intFromBool(self.sidebarRailShown()));
         self.as(gobject.Object).notifyByPspec(properties.@"tabs-visible".impl.param_spec);
         self.scheduleSidebarRebuild();
+    }
+
+    fn sidebarPanedPosition(
+        paned: *gtk.Paned,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        // Ignore positions from layout while hidden or not yet mapped.
+        const box = self.private().sidebar_box.as(gtk.Widget);
+        if (box.getVisible() == 0 or box.getMapped() == 0) return;
+        const pos = paned.getPosition();
+        if (pos >= 180) sidebar_width = pos;
+    }
+
+    fn actionToggleTabSidebar(_: *gio.SimpleAction, _: ?*glib.Variant, self: *Self) callconv(.c) void {
+        _ = self.toggleTabSidebar();
+        self.focusActiveSurface();
     }
 
     //---------------------------------------------------------------
@@ -955,8 +988,15 @@ pub const Window = extern struct {
 
         const box = gtk.Box.new(.horizontal, 6);
 
+        // Shown only on the selected row, by CSS.
+        const dot = gtk.Image.newFromIconName("media-record-symbolic");
+        dot.as(gtk.Widget).addCssClass("active-dot");
+        dot.as(gtk.Widget).setValign(.center);
+        box.append(dot.as(gtk.Widget));
+
         // Bound rather than rebuilt: shells retitle the tab on every command.
         const title = gtk.Label.new(null);
+        title.as(gtk.Widget).addCssClass("tab-title");
         title.setXalign(0);
         title.setEllipsize(.end);
         title.as(gtk.Widget).setHexpand(1);
@@ -1526,7 +1566,7 @@ pub const Window = extern struct {
                 return true;
             },
             .native => {
-                if (self.sidebarShown()) return false;
+                if (self.sidebarShown() or self.sidebarRailShown()) return false;
                 return switch (config.@"window-show-tab-bar") {
                     .always, .auto => true,
                     .never => false,
@@ -2648,7 +2688,9 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("tab_overview", .{});
             class.bindTemplateChildPrivate("tab_bar", .{});
             class.bindTemplateChildPrivate("tab_view", .{});
-            class.bindTemplateChildPrivate("sidebar_split", .{});
+            class.bindTemplateChildPrivate("sidebar_paned", .{});
+            class.bindTemplateChildPrivate("sidebar_box", .{});
+            class.bindTemplateChildPrivate("sidebar_rail", .{});
             class.bindTemplateChildPrivate("sidebar_list", .{});
             class.bindTemplateChildPrivate("toolbar", .{});
             class.bindTemplateChildPrivate("toast_overlay", .{});
@@ -2664,6 +2706,7 @@ pub const Window = extern struct {
             class.bindTemplateCallback("page_detached", &tabViewPageDetached);
             class.bindTemplateCallback("page_reordered", &tabViewPageReordered);
             class.bindTemplateCallback("sidebar_row_activated", &sidebarRowActivated);
+            class.bindTemplateCallback("sidebar_paned_position", &sidebarPanedPosition);
             class.bindTemplateCallback("setup_tab_menu", &setupTabMenu);
             class.bindTemplateCallback("tab_create_window", &tabViewCreateWindow);
             class.bindTemplateCallback("notify_n_pages", &tabViewNPages);
