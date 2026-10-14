@@ -156,14 +156,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
 
             orientation: horizontal;
 
-            Gtk.Label {
-              styles [
-                "dim-label",
-                "caption-heading",
-              ]
-
-              label: _("TABS");
-              xalign: 0;
+            Gtk.Box {
               hexpand: true;
             }
 

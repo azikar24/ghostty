@@ -282,6 +282,10 @@ pub const Window = extern struct {
         /// Group whose rename dialog is open.
         renaming_group: u32 = 0,
 
+        /// Desktop notifications from this window's terminals, oldest
+        /// first, listed in the sidebar until seen.
+        notifications: std.ArrayListUnmanaged(SidebarNotification),
+
         // Template bindings
         tab_overview: *adw.TabOverview,
         tab_bar: *adw.TabBar,
@@ -356,6 +360,7 @@ pub const Window = extern struct {
 
         priv.groups = .empty;
         priv.workspaces = .empty;
+        priv.notifications = .empty;
         const first = self.addWorkspace(self.addGroup(null));
         if (first == 0) @panic("oom");
         self.activateWorkspace(first);
@@ -416,6 +421,7 @@ pub const Window = extern struct {
             .init("toggle-inspector", actionToggleInspector, null),
             .init("new-group", actionNewGroup, null),
             .init("toggle-tab-sidebar", actionToggleTabSidebar, null),
+            .init("clear-notifications", actionClearNotifications, null),
             .init("group-new-tab", actionGroupNewTab, u_variant_type),
             .init("group-rename", actionGroupRename, u_variant_type),
             .init("group-close", actionGroupClose, u_variant_type),
@@ -907,6 +913,235 @@ pub const Window = extern struct {
     }
 
     //---------------------------------------------------------------
+    // Sidebar notifications
+
+    const SidebarNotification = struct {
+        id: u32,
+        title: [:0]u8,
+        body: [:0]u8,
+        /// Unix seconds.
+        time: i64,
+        /// Only compared, never dereferenced, until found in this window
+        /// by locateSurface: the terminal may have closed.
+        surface: *Surface,
+
+        fn deinit(self: *SidebarNotification, alloc: std.mem.Allocator) void {
+            alloc.free(self.title);
+            alloc.free(self.body);
+        }
+    };
+
+    var next_notification_id: u32 = 1;
+    const max_notifications = 30;
+
+    /// List a desktop notification (OSC 9/99/777) from one of this
+    /// window's terminals, unless the user is looking at that terminal.
+    pub fn recordNotification(
+        self: *Self,
+        surface: *Surface,
+        title: [:0]const u8,
+        body: [:0]const u8,
+    ) void {
+        if (self.as(gtk.Window).isActive() != 0 and self.getActiveSurface() == surface) return;
+
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        if (priv.notifications.items.len >= max_notifications) {
+            var oldest = priv.notifications.orderedRemove(0);
+            oldest.deinit(alloc);
+        }
+
+        const t = alloc.dupeZ(u8, if (title.len == 0) "Notification" else title) catch return;
+        const b = alloc.dupeZ(u8, body) catch {
+            alloc.free(t);
+            return;
+        };
+        var n: SidebarNotification = .{
+            .id = next_notification_id,
+            .title = t,
+            .body = b,
+            .time = std.time.timestamp(),
+            .surface = surface,
+        };
+        priv.notifications.append(alloc, n) catch {
+            n.deinit(alloc);
+            return;
+        };
+        next_notification_id += 1;
+        self.scheduleSidebarRebuild();
+    }
+
+    const SurfaceLocation = struct {
+        view: *adw.TabView,
+        page: *adw.TabPage,
+        surface: *Surface,
+    };
+
+    /// Where `surface` is in this window, if it still is.
+    fn locateSurface(self: *Self, surface: *Surface) ?SurfaceLocation {
+        for (self.private().workspaces.items) |ws| {
+            for (0..@intCast(ws.view.getNPages())) |i| {
+                const page = ws.view.getNthPage(@intCast(i));
+                const tab = gobject.ext.cast(Tab, page.getChild()) orelse continue;
+                const tree = tab.getSurfaceTree() orelse continue;
+                var it = tree.iterator();
+                while (it.next()) |entry| {
+                    if (entry.view == surface) return .{ .view = ws.view, .page = page, .surface = entry.view };
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Drop notifications from terminals in `page` (seen) or that closed.
+    fn clearNotificationsFor(self: *Self, page: ?*adw.TabPage) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        var changed = false;
+        var i: usize = 0;
+        while (i < priv.notifications.items.len) {
+            const loc = self.locateSurface(priv.notifications.items[i].surface);
+            if (loc == null or (page != null and loc.?.page == page.?)) {
+                var n = priv.notifications.orderedRemove(i);
+                n.deinit(alloc);
+                changed = true;
+            } else i += 1;
+        }
+        if (changed) self.scheduleSidebarRebuild();
+    }
+
+    /// Show the terminal a notification came from.
+    fn jumpToNotification(self: *Self, id: u32) void {
+        const priv = self.private();
+        for (priv.notifications.items) |n| {
+            if (n.id != id) continue;
+            const loc = self.locateSurface(n.surface) orelse break;
+            if (self.workspaceForView(loc.view)) |ws| {
+                if (loc.view != priv.tab_view) self.activateWorkspace(ws.id);
+            }
+            loc.view.setSelectedPage(loc.page);
+            loc.surface.grabFocus();
+            self.clearNotificationsFor(loc.page);
+            return;
+        }
+        // Its terminal is gone.
+        self.clearNotificationsFor(null);
+    }
+
+    fn workspaceUnread(self: *Self, view: *adw.TabView) usize {
+        var count: usize = 0;
+        for (self.private().notifications.items) |n| {
+            const loc = self.locateSurface(n.surface) orelse continue;
+            if (loc.view == view) count += 1;
+        }
+        return count;
+    }
+
+    fn actionClearNotifications(_: *gio.SimpleAction, _: ?*glib.Variant, self: *Self) callconv(.c) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        for (priv.notifications.items) |*n| n.deinit(alloc);
+        priv.notifications.clearRetainingCapacity();
+        self.scheduleSidebarRebuild();
+        self.focusActiveSurface();
+    }
+
+    fn sidebarSectionRow(label: [*:0]const u8, icon: [*:0]const u8) *gtk.ListBoxRow {
+        const row = gtk.ListBoxRow.new();
+        row.setSelectable(0);
+        row.setActivatable(0);
+        row.as(gtk.Widget).addCssClass("sidebar-section");
+        const box = gtk.Box.new(.horizontal, 6);
+        const image = gtk.Image.newFromIconName(icon);
+        image.as(gtk.Widget).addCssClass("dim-label");
+        box.append(image.as(gtk.Widget));
+        const text = gtk.Label.new(label);
+        text.setXalign(0);
+        text.as(gtk.Widget).setHexpand(1);
+        text.as(gtk.Widget).addCssClass("dim-label");
+        text.as(gtk.Widget).addCssClass("caption-heading");
+        box.append(text.as(gtk.Widget));
+        row.setChild(box.as(gtk.Widget));
+        return row;
+    }
+
+    fn notificationHeaderRow(count: usize) *gtk.ListBoxRow {
+        const row = sidebarSectionRow(i18n._("NOTIFICATIONS"), "preferences-system-notifications-symbolic");
+        const box = gobject.ext.cast(gtk.Box, row.getChild().?).?;
+
+        var buf: [32]u8 = undefined;
+        const badge = gtk.Label.new((std.fmt.bufPrintZ(&buf, "{d}", .{count}) catch "").ptr);
+        badge.as(gtk.Widget).addCssClass("unread-badge");
+        badge.as(gtk.Widget).setValign(.center);
+        box.append(badge.as(gtk.Widget));
+
+        const clear = gtk.Button.newFromIconName("edit-clear-all-symbolic");
+        clear.as(gtk.Widget).addCssClass("flat");
+        clear.as(gtk.Widget).setValign(.center);
+        clear.as(gtk.Widget).setTooltipText(i18n._("Clear Notifications"));
+        clear.as(gtk.Widget).setFocusOnClick(0);
+        gtk.Actionable.setActionName(clear.as(gtk.Actionable), "win.clear-notifications");
+        box.append(clear.as(gtk.Widget));
+        return row;
+    }
+
+    fn notificationRow(self: *Self, n: SidebarNotification, now: i64) *gtk.ListBoxRow {
+        const row = gtk.ListBoxRow.new();
+        row.setSelectable(0);
+        row.as(gtk.Widget).addCssClass("sidebar-notification");
+        row.as(gobject.Object).setData("ghostty-notification", @ptrFromInt(n.id));
+
+        const col = gtk.Box.new(.vertical, 1);
+
+        const top = gtk.Box.new(.horizontal, 6);
+        const title = gtk.Label.new(n.title.ptr);
+        title.setXalign(0);
+        title.setEllipsize(.end);
+        title.as(gtk.Widget).setHexpand(1);
+        title.as(gtk.Widget).addCssClass("notification-title");
+        top.append(title.as(gtk.Widget));
+
+        var buf: [64]u8 = undefined;
+        const age: u64 = @intCast(@max(0, now - n.time));
+        const when = if (age < 60)
+            std.fmt.bufPrintZ(&buf, "now", .{}) catch ""
+        else if (age < 3600)
+            std.fmt.bufPrintZ(&buf, "{d}m", .{age / 60}) catch ""
+        else if (age < 86400)
+            std.fmt.bufPrintZ(&buf, "{d}h", .{age / 3600}) catch ""
+        else
+            std.fmt.bufPrintZ(&buf, "{d}d", .{age / 86400}) catch "";
+        const time = gtk.Label.new(when.ptr);
+        time.as(gtk.Widget).addCssClass("notification-meta");
+        time.as(gtk.Widget).addCssClass("dim-label");
+        top.append(time.as(gtk.Widget));
+        col.append(top.as(gtk.Widget));
+
+        if (n.body.len > 0) {
+            const body = gtk.Label.new(n.body.ptr);
+            body.setXalign(0);
+            body.setEllipsize(.end);
+            body.as(gtk.Widget).addCssClass("notification-body");
+            body.as(gtk.Widget).addCssClass("dim-label");
+            col.append(body.as(gtk.Widget));
+        }
+
+        // Which tab it came from.
+        if (self.locateSurface(n.surface)) |loc| {
+            const source = gtk.Label.new(null);
+            source.setXalign(0);
+            source.setEllipsize(.end);
+            source.as(gtk.Widget).addCssClass("notification-meta");
+            source.as(gtk.Widget).addCssClass("dim-label");
+            _ = loc.page.as(gobject.Object).bindProperty("title", source.as(gobject.Object), "label", .{ .sync_create = true });
+            col.append(source.as(gtk.Widget));
+        }
+
+        row.setChild(col.as(gtk.Widget));
+        return row;
+    }
+
+    //---------------------------------------------------------------
     // Sidebar rows
 
     /// Rebuild the sidebar on idle, so a burst of changes rebuilds once.
@@ -978,6 +1213,20 @@ pub const Window = extern struct {
         const priv = self.private();
         const list = priv.sidebar_list;
         list.removeAll();
+
+        // Notifications, newest first, minus those whose terminal closed.
+        self.clearNotificationsFor(null);
+        if (priv.notifications.items.len > 0) {
+            list.append(notificationHeaderRow(priv.notifications.items.len).as(gtk.Widget));
+            const now = std.time.timestamp();
+            var i = priv.notifications.items.len;
+            while (i > 0) {
+                i -= 1;
+                list.append(self.notificationRow(priv.notifications.items[i], now).as(gtk.Widget));
+            }
+        }
+
+        list.append(sidebarSectionRow(i18n._("TABS"), "view-list-symbolic").as(gtk.Widget));
         for (priv.groups.items) |*group| {
             list.append(sidebarGroupRow(group, self.groupWorkspaceCount(group.id)).as(gtk.Widget));
             for (priv.workspaces.items) |ws| {
@@ -1100,6 +1349,16 @@ pub const Window = extern struct {
             box.append(bell.as(gtk.Widget));
         }
 
+        // Unseen notifications from its tabs.
+        const unread = self.workspaceUnread(ws.view);
+        if (unread > 0) {
+            var buf: [32]u8 = undefined;
+            const badge = gtk.Label.new((std.fmt.bufPrintZ(&buf, "{d}", .{unread}) catch "").ptr);
+            badge.as(gtk.Widget).addCssClass("unread-badge");
+            badge.as(gtk.Widget).setValign(.center);
+            box.append(badge.as(gtk.Widget));
+        }
+
         // How many tabs it holds, when more than one.
         if (n > 1) {
             var buf: [32]u8 = undefined;
@@ -1143,6 +1402,11 @@ pub const Window = extern struct {
             const group = self.findGroup(@intCast(@intFromPtr(raw))) orelse return;
             group.collapsed = !group.collapsed;
             self.scheduleSidebarRebuild();
+            return;
+        }
+
+        if (obj.getData("ghostty-notification")) |raw| {
+            self.jumpToNotification(@intCast(@intFromPtr(raw)));
             return;
         }
 
@@ -1736,6 +2000,9 @@ pub const Window = extern struct {
         // Don't change urgency if we're not the active window.
         if (self.as(gtk.Window).isActive() == 0) return;
 
+        // The selected tab's notifications have now been seen.
+        if (self.private().tab_view.getSelectedPage()) |page| self.clearNotificationsFor(page);
+
         self.winproto().setUrgent(false) catch |err| {
             log.warn(
                 "winproto failed to reset urgency={}",
@@ -1893,6 +2160,8 @@ pub const Window = extern struct {
         for (priv.groups.items) |*g| g.deinit(alloc);
         priv.groups.deinit(alloc);
         priv.workspaces.deinit(alloc);
+        for (priv.notifications.items) |*n| n.deinit(alloc);
+        priv.notifications.deinit(alloc);
         priv.tab_bindings.unref();
         priv.winproto.deinit(Application.default().allocator());
 
@@ -2132,6 +2401,8 @@ pub const Window = extern struct {
         // If the tab was previously marked as needing attention
         // (e.g. due to a bell character), we now unmark that
         page.setNeedsAttention(@intFromBool(false));
+
+        if (self.as(gtk.Window).isActive() != 0) self.clearNotificationsFor(page);
     }
 
     fn tabViewPageReordered(
