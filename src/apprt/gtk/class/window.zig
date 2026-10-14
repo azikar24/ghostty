@@ -28,6 +28,7 @@ const Surface = @import("surface.zig").Surface;
 const Tab = @import("tab.zig").Tab;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
+const TitleDialog = @import("title_dialog.zig").TitleDialog;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 
 const log = std.log.scoped(.gtk_ghostty_window);
@@ -267,6 +268,12 @@ pub const Window = extern struct {
         /// signals it causes don't queue another rebuild.
         sidebar_rebuilding: bool = false,
 
+        /// Sidebar groups in display order. Tabs refer to them by id.
+        groups: std.ArrayListUnmanaged(SidebarGroup),
+
+        /// Group whose rename dialog is open.
+        renaming_group: u32 = 0,
+
         // Template bindings
         tab_overview: *adw.TabOverview,
         tab_bar: *adw.TabBar,
@@ -335,6 +342,8 @@ pub const Window = extern struct {
         // because its dependent on the build config.
         self.as(gtk.Window).setIconName(build_config.bundle_id);
 
+        priv.groups = .empty;
+
         // Initialize our actions
         self.initActionMap();
 
@@ -365,6 +374,8 @@ pub const Window = extern struct {
     fn initActionMap(self: *Self) void {
         const s_variant_type = glib.ext.VariantType.newFor([:0]const u8);
         defer s_variant_type.free();
+        const u_variant_type = glib.ext.VariantType.newFor(u32);
+        defer u_variant_type.free();
 
         const actions = [_]ext.actions.Action(Self){
             .init("about", actionAbout, null),
@@ -387,6 +398,10 @@ pub const Window = extern struct {
             // TODO: accept the surface that toggled the command palette
             .init("toggle-command-palette", actionToggleCommandPalette, null),
             .init("toggle-inspector", actionToggleInspector, null),
+            .init("new-group", actionNewGroup, null),
+            .init("group-new-tab", actionGroupNewTab, u_variant_type),
+            .init("group-rename", actionGroupRename, u_variant_type),
+            .init("group-close", actionGroupClose, u_variant_type),
         };
 
         ext.actions.add(Self, self, &actions);
@@ -434,6 +449,8 @@ pub const Window = extern struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
+            /// Sidebar group; zero joins the selected tab's group.
+            group: u32 = 0,
 
             pub const none: @This() = .{};
         },
@@ -451,6 +468,17 @@ pub const Window = extern struct {
             },
         );
 
+        // Join the requested group, else the selected tab's, else start a
+        // group named after the directory the tab starts in.
+        tab.setGroupId(group: {
+            if (overrides.group != 0) break :group overrides.group;
+            const current = self.selectedGroupId(null);
+            if (current != 0) break :group current;
+            const dir = overrides.working_directory orelse
+                if (parent_) |p| p.rt_surface.surface.getPwd() else null;
+            break :group self.addGroup(dir);
+        });
+
         if (parent_) |p| {
             // For a new window's first tab, inherit the parent's initial size hints.
             if (context == .window) {
@@ -458,12 +486,6 @@ pub const Window = extern struct {
             }
             tab.setParentWithContext(p, context);
 
-            // A new tab joins its parent's sidebar group.
-            if (context == .tab) {
-                if (ext.getAncestor(Tab, p.rt_surface.surface.as(gtk.Widget))) |parent_tab| {
-                    if (parent_tab.getGroup()) |group| _ = tab.pinGroup(group);
-                }
-            }
         }
 
         // Get the position that we should insert the new tab at.
@@ -654,6 +676,127 @@ pub const Window = extern struct {
         self.scheduleSidebarRebuild();
     }
 
+    //---------------------------------------------------------------
+    // Sidebar groups
+
+    /// A named set of tabs in the sidebar. Every tab belongs to exactly
+    /// one group; a group disappears when its last tab closes.
+    const SidebarGroup = struct {
+        id: u32,
+        name: [:0]u8,
+        /// Where the group's new tabs start. Null until known.
+        dir: ?[:0]u8,
+        /// Set by the user, so a later `dir` doesn't rename it.
+        renamed: bool = false,
+        collapsed: bool = false,
+
+        fn deinit(self: *SidebarGroup, alloc: std.mem.Allocator) void {
+            alloc.free(self.name);
+            if (self.dir) |d| alloc.free(d);
+        }
+    };
+
+    /// Group ids are unique across windows so a tab dragged between
+    /// windows can't land in an unrelated group with the same id.
+    var next_group_id: u32 = 1;
+
+    /// Do not keep the pointer across anything that can add a group.
+    fn findGroup(self: *Self, id: u32) ?*SidebarGroup {
+        if (id == 0) return null;
+        for (self.private().groups.items) |*g| if (g.id == id) return g;
+        return null;
+    }
+
+    /// Append a group for `dir` and return its id, or zero on OOM.
+    fn addGroup(self: *Self, dir: ?[]const u8) u32 {
+        const alloc = Application.default().allocator();
+        const name = groupNameFor(alloc, dir) catch return 0;
+        const dir_copy: ?[:0]u8 = if (dir) |d| alloc.dupeZ(u8, d) catch null else null;
+        var group: SidebarGroup = .{ .id = next_group_id, .name = name, .dir = dir_copy };
+        self.private().groups.append(alloc, group) catch {
+            group.deinit(alloc);
+            return 0;
+        };
+        next_group_id += 1;
+        return group.id;
+    }
+
+    fn setGroupDir(group: *SidebarGroup, dir: []const u8) void {
+        const alloc = Application.default().allocator();
+        if (group.dir != null) return;
+        group.dir = alloc.dupeZ(u8, dir) catch return;
+        if (group.renamed) return;
+        const name = groupNameFor(alloc, dir) catch return;
+        alloc.free(group.name);
+        group.name = name;
+    }
+
+    /// Default group name: the directory's name, `~` for home.
+    fn groupNameFor(alloc: std.mem.Allocator, dir_: ?[]const u8) ![:0]u8 {
+        const dir = dir_ orelse return alloc.dupeZ(u8, "Terminal");
+        const home = std.posix.getenv("HOME") orelse "";
+        const trimmed = std.mem.trimRight(u8, dir, "/");
+        if (home.len > 0 and std.mem.eql(u8, trimmed, std.mem.trimRight(u8, home, "/")))
+            return alloc.dupeZ(u8, "~");
+        const base = std.fs.path.basename(trimmed);
+        return alloc.dupeZ(u8, if (base.len == 0) "/" else base);
+    }
+
+    /// The selected tab's group, ignoring `except` (a tab being attached
+    /// may already be the selected page). Zero if none.
+    fn selectedGroupId(self: *Self, except: ?*Tab) u32 {
+        const tab = self.getSelectedTab() orelse return 0;
+        if (tab == except) return 0;
+        const id = tab.getGroupId();
+        return if (self.findGroup(id) != null) id else 0;
+    }
+
+    fn groupTabCount(self: *Self, id: u32) usize {
+        const tab_view = self.private().tab_view;
+        var count: usize = 0;
+        for (0..@intCast(tab_view.getNPages())) |i| {
+            if (pageGroupId(tab_view.getNthPage(@intCast(i))) == id) count += 1;
+        }
+        return count;
+    }
+
+    /// Open a tab in a new group that starts in the current tab's folder.
+    pub fn newTabGroup(self: *Self) void {
+        const dir: ?[:0]const u8 = if (self.getActiveSurface()) |s| s.getPwd() else null;
+        const id = self.addGroup(dir);
+        if (id == 0) return;
+        _ = self.newTabPage(null, .tab, .{ .working_directory = dir, .group = id });
+        self.focusActiveSurface();
+    }
+
+    /// Open a tab at the end of a group, in the group's folder.
+    pub fn newTabInGroup(self: *Self, id: u32) void {
+        const group = self.findGroup(id) orelse return;
+        group.collapsed = false;
+        const page = self.newTabPage(null, .tab, .{ .working_directory = group.dir, .group = id });
+
+        // New tabs go after the selected tab, which may be in another
+        // group; move it behind the group's other tabs.
+        const tab_view = self.private().tab_view;
+        var last: ?usize = null;
+        for (0..@intCast(tab_view.getNPages())) |i| {
+            const other = tab_view.getNthPage(@intCast(i));
+            if (other != page and pageGroupId(other) == id) last = i;
+        }
+        if (last) |l| {
+            const pos: usize = @intCast(tab_view.getPagePosition(page));
+            _ = tab_view.reorderPage(page, @intCast(if (pos > l) l + 1 else l));
+        }
+        self.focusActiveSurface();
+    }
+
+    fn focusActiveSurface(self: *Self) void {
+        if (self.getActiveSurface()) |surface| surface.grabFocus();
+    }
+
+    //---------------------------------------------------------------
+    // Sidebar rows
+
     /// Rebuild the sidebar on idle, so a burst of changes rebuilds once.
     fn scheduleSidebarRebuild(self: *Self) void {
         const priv = self.private();
@@ -672,125 +815,165 @@ pub const Window = extern struct {
         return 0;
     }
 
+    /// Select the row of the selected tab without rebuilding, so open
+    /// menus and hover state survive tab switches.
+    fn syncSidebarSelection(self: *Self) void {
+        if (!self.sidebarShown()) return;
+        const priv = self.private();
+        const page = priv.tab_view.getSelectedPage() orelse return;
+        var i: c_int = 0;
+        while (priv.sidebar_list.getRowAtIndex(i)) |row| : (i += 1) {
+            const raw = row.as(gobject.Object).getData("ghostty-page") orelse continue;
+            if (@intFromPtr(raw) != @intFromPtr(page)) continue;
+            priv.sidebar_list.selectRow(row);
+            return;
+        }
+        // Its row is missing (e.g. a collapsed group), so redraw.
+        self.scheduleSidebarRebuild();
+    }
+
     fn rebuildSidebar(self: *Self) void {
         const priv = self.private();
         const tab_view = priv.tab_view;
-        const list = priv.sidebar_list;
+        const alloc = Application.default().allocator();
         const n: usize = @intCast(tab_view.getNPages());
 
-        for (0..n) |i| {
-            const tab = pageTab(tab_view.getNthPage(@intCast(i))) orelse continue;
-            pinGroupFromPwd(tab);
+        // Drop groups whose tabs have all closed.
+        var gi: usize = 0;
+        while (gi < priv.groups.items.len) {
+            if (self.groupTabCount(priv.groups.items[gi].id) == 0) {
+                var group = priv.groups.orderedRemove(gi);
+                group.deinit(alloc);
+            } else gi += 1;
         }
 
-        // Keep each group's tabs together, groups in order of first
-        // appearance, so tab order (next_tab, goto_tab) matches the sidebar.
-        var start: usize = 0;
-        while (start < n) {
-            const group = pageGroup(tab_view.getNthPage(@intCast(start)));
-            var end = start + 1;
-            for (end..n) |i| {
+        // Keep tab order equal to sidebar order (groups in order, tabs in
+        // their relative order) so next_tab and goto_tab follow the sidebar.
+        var pos: usize = 0;
+        for (priv.groups.items) |group| {
+            for (pos..n) |i| {
                 const page = tab_view.getNthPage(@intCast(i));
-                if (!groupEql(group, pageGroup(page))) continue;
-                if (i != end) _ = tab_view.reorderPage(page, @intCast(end));
-                end += 1;
+                if (pageGroupId(page) != group.id) continue;
+                if (i != pos) _ = tab_view.reorderPage(page, @intCast(pos));
+                pos += 1;
             }
-            start = end;
         }
 
+        const list = priv.sidebar_list;
         list.removeAll();
         const selected = tab_view.getSelectedPage();
-        var prev: ?*Tab = null;
-        for (0..n) |i| {
-            const page = tab_view.getNthPage(@intCast(i));
-            const tab = pageTab(page) orelse continue;
-            if (prev == null or !groupEql(prev.?.getGroup(), tab.getGroup())) {
-                list.append(self.sidebarGroupRow(tab).as(gtk.Widget));
+        var i: usize = 0;
+        for (priv.groups.items) |*group| {
+            const count = self.groupTabCount(group.id);
+            list.append(sidebarGroupRow(group, count).as(gtk.Widget));
+            for (0..count) |_| {
+                const page = tab_view.getNthPage(@intCast(i));
+                i += 1;
+                const is_selected = selected == page;
+                if (group.collapsed and !is_selected) continue;
+                const row = self.sidebarTabRow(page);
+                list.append(row.as(gtk.Widget));
+                if (is_selected) list.selectRow(row);
             }
-            prev = tab;
-
-            const row = self.sidebarTabRow(page, tab);
-            list.append(row.as(gtk.Widget));
-            if (selected == page) list.selectRow(row);
         }
     }
 
-    fn sidebarGroupRow(self: *Self, tab: *Tab) *gtk.ListBoxRow {
+    fn sidebarGroupRow(group: *const SidebarGroup, count: usize) *gtk.ListBoxRow {
         const row = gtk.ListBoxRow.new();
-        row.setActivatable(0);
         row.setSelectable(0);
+        row.as(gtk.Widget).addCssClass("sidebar-group");
+        row.as(gobject.Object).setData("ghostty-group", @ptrFromInt(group.id));
+        if (group.dir) |dir| {
+            var buf: [std.fs.max_path_bytes + 2]u8 = undefined;
+            row.as(gtk.Widget).setTooltipText(abbrevHome(&buf, dir));
+        }
 
         const box = gtk.Box.new(.horizontal, 6);
-        box.as(gtk.Widget).setMarginTop(6);
 
-        var buf: [std.fs.max_path_bytes + 2]u8 = undefined;
-        const group = tab.getGroup();
-        const label = gtk.Label.new(if (group) |g| groupName(&buf, g) else i18n._("Starting…"));
-        label.setXalign(0);
-        label.setEllipsize(.middle);
-        label.as(gtk.Widget).setHexpand(1);
-        label.as(gtk.Widget).addCssClass("heading");
-        box.append(label.as(gtk.Widget));
+        const arrow = gtk.Image.newFromIconName(
+            if (group.collapsed) "pan-end-symbolic" else "pan-down-symbolic",
+        );
+        arrow.as(gtk.Widget).addCssClass("dim-label");
+        box.append(arrow.as(gtk.Widget));
+        box.append(gtk.Image.newFromIconName("folder-symbolic").as(gtk.Widget));
 
-        if (group) |g| {
-            label.as(gtk.Widget).setTooltipText(abbrevHome(&buf, g));
+        const name = gtk.Label.new(group.name.ptr);
+        name.setXalign(0);
+        name.setEllipsize(.end);
+        name.as(gtk.Widget).setHexpand(1);
+        name.setWidthChars(6);
+        name.as(gtk.Widget).addCssClass("group-name");
+        box.append(name.as(gtk.Widget));
 
-            const button = gtk.Button.newFromIconName("tab-new-symbolic");
-            button.as(gtk.Widget).addCssClass("flat");
-            button.as(gtk.Widget).setTooltipText(i18n._("New Tab Here"));
-            button.as(gtk.Widget).setFocusOnClick(0);
-            button.as(gobject.Object).setDataFull(
-                "ghostty-group",
-                glib.ext.dupeZ(u8, g).ptr,
-                glib.free,
-            );
-            _ = gtk.Button.signals.clicked.connect(
-                button,
-                *Self,
-                sidebarNewTabClicked,
-                self,
-                .{},
-            );
-            box.append(button.as(gtk.Widget));
-        }
+        var buf: [64]u8 = undefined;
+        const count_label = gtk.Label.new((std.fmt.bufPrintZ(&buf, "{d}", .{count}) catch "").ptr);
+        count_label.as(gtk.Widget).addCssClass("group-count");
+        count_label.as(gtk.Widget).addCssClass("dim-label");
+        count_label.as(gtk.Widget).setValign(.center);
+        box.append(count_label.as(gtk.Widget));
+
+        const add = gtk.Button.newFromIconName("list-add-symbolic");
+        add.as(gtk.Widget).addCssClass("flat");
+        add.as(gtk.Widget).addCssClass("hover-only");
+        add.as(gtk.Widget).setTooltipText(i18n._("New Tab in Group"));
+        add.as(gtk.Widget).setFocusOnClick(0);
+        add.as(gtk.Widget).setValign(.center);
+        gtk.Actionable.setDetailedActionName(
+            add.as(gtk.Actionable),
+            (std.fmt.bufPrintZ(&buf, "win.group-new-tab(uint32 {d})", .{group.id}) catch "").ptr,
+        );
+        box.append(add.as(gtk.Widget));
+
+        const menu = gio.Menu.new();
+        defer menu.unref();
+        menu.append(
+            i18n._("Rename Group…"),
+            (std.fmt.bufPrintZ(&buf, "win.group-rename(uint32 {d})", .{group.id}) catch "").ptr,
+        );
+        menu.append(
+            i18n._("Close Group"),
+            (std.fmt.bufPrintZ(&buf, "win.group-close(uint32 {d})", .{group.id}) catch "").ptr,
+        );
+        const more = gtk.MenuButton.new();
+        more.setIconName("view-more-symbolic");
+        more.setMenuModel(menu.as(gio.MenuModel));
+        more.as(gtk.Widget).addCssClass("flat");
+        more.as(gtk.Widget).addCssClass("hover-only");
+        more.as(gtk.Widget).setTooltipText(i18n._("Group Menu"));
+        more.as(gtk.Widget).setFocusOnClick(0);
+        more.as(gtk.Widget).setValign(.center);
+        box.append(more.as(gtk.Widget));
 
         row.setChild(box.as(gtk.Widget));
         return row;
     }
 
-    fn sidebarTabRow(self: *Self, page: *adw.TabPage, tab: *Tab) *gtk.ListBoxRow {
+    fn sidebarTabRow(self: *Self, page: *adw.TabPage) *gtk.ListBoxRow {
         const row = gtk.ListBoxRow.new();
+        row.as(gtk.Widget).addCssClass("sidebar-tab");
         row.as(gobject.Object).setData("ghostty-page", page);
 
         const box = gtk.Box.new(.horizontal, 6);
-        box.as(gtk.Widget).setMarginStart(10);
 
-        const text = gtk.Box.new(.vertical, 0);
-        text.as(gtk.Widget).setHexpand(1);
-        text.as(gtk.Widget).setValign(.center);
-
-        const title = gtk.Label.new(page.getTitle());
+        // Bound rather than rebuilt: shells retitle the tab on every command.
+        const title = gtk.Label.new(null);
         title.setXalign(0);
         title.setEllipsize(.end);
-        if (page.getNeedsAttention() != 0) title.as(gtk.Widget).addCssClass("accent");
-        text.append(title.as(gtk.Widget));
+        title.as(gtk.Widget).setHexpand(1);
+        _ = page.as(gobject.Object).bindProperty("title", title.as(gobject.Object), "label", .{ .sync_create = true });
+        _ = page.as(gobject.Object).bindProperty("tooltip", row.as(gobject.Object), "tooltip-markup", .{ .sync_create = true });
+        box.append(title.as(gtk.Widget));
 
-        // Show where the tab is now if it has left its group's directory.
-        const pwd: ?[:0]const u8 = if (tab.getActiveSurface()) |s| s.getPwd() else null;
-        if (pwd) |dir| if (!groupEql(tab.getGroup(), dir)) {
-            var buf: [std.fs.max_path_bytes + 2]u8 = undefined;
-            const sub = gtk.Label.new(abbrevHome(&buf, dir));
-            sub.setXalign(0);
-            sub.setEllipsize(.middle);
-            sub.as(gtk.Widget).addCssClass("dim-label");
-            sub.as(gtk.Widget).addCssClass("caption");
-            text.append(sub.as(gtk.Widget));
-        };
-        box.append(text.as(gtk.Widget));
+        const bell = gtk.Image.newFromIconName("media-record-symbolic");
+        bell.as(gtk.Widget).addCssClass("attention");
+        bell.as(gtk.Widget).setValign(.center);
+        _ = page.as(gobject.Object).bindProperty("needs-attention", bell.as(gobject.Object), "visible", .{ .sync_create = true });
+        box.append(bell.as(gtk.Widget));
 
         const close = gtk.Button.newFromIconName("window-close-symbolic");
         close.as(gtk.Widget).addCssClass("flat");
         close.as(gtk.Widget).addCssClass("circular");
+        close.as(gtk.Widget).addCssClass("close");
         close.as(gtk.Widget).setValign(.center);
         close.as(gtk.Widget).setTooltipText(i18n._("Close Tab"));
         close.as(gtk.Widget).setFocusOnClick(0);
@@ -814,8 +997,7 @@ pub const Window = extern struct {
     fn sidebarPage(self: *Self, obj: *gobject.Object) ?*adw.TabPage {
         const raw = obj.getData("ghostty-page") orelse return null;
         const tab_view = self.private().tab_view;
-        const n: usize = @intCast(tab_view.getNPages());
-        for (0..n) |i| {
+        for (0..@intCast(tab_view.getNPages())) |i| {
             const page = tab_view.getNthPage(@intCast(i));
             if (@intFromPtr(page) == @intFromPtr(raw)) return page;
         }
@@ -827,10 +1009,19 @@ pub const Window = extern struct {
         row: *gtk.ListBoxRow,
         self: *Self,
     ) callconv(.c) void {
-        const page = self.sidebarPage(row.as(gobject.Object)) orelse return;
+        const obj = row.as(gobject.Object);
+
+        // Group header: collapse or expand.
+        if (obj.getData("ghostty-group")) |raw| {
+            const group = self.findGroup(@intCast(@intFromPtr(raw))) orelse return;
+            group.collapsed = !group.collapsed;
+            self.scheduleSidebarRebuild();
+            return;
+        }
+
+        const page = self.sidebarPage(obj) orelse return;
         self.private().tab_view.setSelectedPage(page);
-        // Keep typing going to the terminal, not the list.
-        if (self.getActiveSurface()) |surface| surface.grabFocus();
+        self.focusActiveSurface();
     }
 
     fn sidebarCloseClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
@@ -838,46 +1029,57 @@ pub const Window = extern struct {
         self.private().tab_view.closePage(page);
     }
 
-    fn sidebarNewTabClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        const raw = button.as(gobject.Object).getData("ghostty-group") orelse return;
-        const group = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
-        const page = self.newTabPage(null, .tab, .{ .working_directory = group });
+    fn actionNewGroup(_: *gio.SimpleAction, _: ?*glib.Variant, self: *Self) callconv(.c) void {
+        self.newTabGroup();
+    }
 
-        // Insert after the group's last tab rather than after the
-        // selected tab, which may be in another group.
+    fn actionGroupNewTab(_: *gio.SimpleAction, param: ?*glib.Variant, self: *Self) callconv(.c) void {
+        self.newTabInGroup((param orelse return).getUint32());
+    }
+
+    fn actionGroupRename(_: *gio.SimpleAction, param: ?*glib.Variant, self: *Self) callconv(.c) void {
+        const id = (param orelse return).getUint32();
+        const group = self.findGroup(id) orelse return;
+        self.private().renaming_group = id;
+        const dialog = TitleDialog.new(.group, group.name);
+        _ = TitleDialog.signals.set.connect(dialog, *Self, groupRenameSet, self, .{});
+        dialog.present(self.as(gtk.Widget));
+    }
+
+    fn groupRenameSet(_: *TitleDialog, title_ptr: [*:0]const u8, self: *Self) callconv(.c) void {
+        const group = self.findGroup(self.private().renaming_group) orelse return;
+        const alloc = Application.default().allocator();
+        const title = std.mem.span(title_ptr);
+        // An empty name goes back to the folder name.
+        const name = if (title.len == 0)
+            groupNameFor(alloc, group.dir) catch return
+        else
+            alloc.dupeZ(u8, title) catch return;
+        alloc.free(group.name);
+        group.name = name;
+        group.renamed = title.len != 0;
+        self.scheduleSidebarRebuild();
+    }
+
+    fn actionGroupClose(_: *gio.SimpleAction, param: ?*glib.Variant, self: *Self) callconv(.c) void {
+        const id = (param orelse return).getUint32();
         const tab_view = self.private().tab_view;
-        const n: usize = @intCast(tab_view.getNPages());
-        var last: ?usize = null;
-        for (0..n) |i| {
-            const other = tab_view.getNthPage(@intCast(i));
-            if (other != page and groupEql(group, pageGroup(other))) last = i;
+        // Backwards, since pages may be removed as we go.
+        var i = tab_view.getNPages();
+        while (i > 0) {
+            i -= 1;
+            const page = tab_view.getNthPage(i);
+            if (pageGroupId(page) == id) tab_view.closePage(page);
         }
-        if (last) |l| {
-            const pos: usize = @intCast(tab_view.getPagePosition(page));
-            _ = tab_view.reorderPage(page, @intCast(if (pos > l) l + 1 else l));
-        }
-        if (self.getActiveSurface()) |surface| surface.grabFocus();
     }
 
     fn pageTab(page: *adw.TabPage) ?*Tab {
         return gobject.ext.cast(Tab, page.getChild());
     }
 
-    fn pageGroup(page: *adw.TabPage) ?[:0]const u8 {
-        const tab = pageTab(page) orelse return null;
-        return tab.getGroup();
-    }
-
-    fn pinGroupFromPwd(tab: *Tab) void {
-        const surface = tab.getActiveSurface() orelse return;
-        const pwd = surface.getPwd() orelse return;
-        _ = tab.pinGroup(pwd);
-    }
-
-    fn groupEql(a: ?[:0]const u8, b: ?[:0]const u8) bool {
-        const x = a orelse return b == null;
-        const y = b orelse return false;
-        return std.mem.eql(u8, x, y);
+    fn pageGroupId(page: *adw.TabPage) u32 {
+        const tab = pageTab(page) orelse return 0;
+        return tab.getGroupId();
     }
 
     /// `dir` with $HOME shortened to `~`, written to buf.
@@ -889,18 +1091,6 @@ pub const Window = extern struct {
             return std.fmt.bufPrintZ(buf, "~{s}", .{dir[home.len..]}) catch dir;
         }
         return dir;
-    }
-
-    /// Short group label: the directory's name, or `~` for home.
-    fn groupName(buf: []u8, dir: [:0]const u8) [:0]const u8 {
-        const short = abbrevHome(buf, dir);
-        if (std.mem.eql(u8, short, "~") or std.mem.eql(u8, short, "/")) return short;
-        const trimmed = std.mem.trimRight(u8, short, "/");
-        const base = std.fs.path.basename(trimmed);
-        // base ends where short ends (or one before a trailing slash),
-        // so it is only NUL-terminated when nothing was trimmed.
-        if (trimmed.len != short.len) return short;
-        return short[short.len - base.len ..];
     }
 
     pub fn toggleTabOverview(self: *Self) void {
@@ -1568,6 +1758,9 @@ pub const Window = extern struct {
 
     fn finalize(self: *Self) callconv(.c) void {
         const priv = self.private();
+        const alloc = Application.default().allocator();
+        for (priv.groups.items) |*g| g.deinit(alloc);
+        priv.groups.deinit(alloc);
         priv.tab_bindings.unref();
         priv.winproto.deinit(Application.default().allocator());
 
@@ -1800,7 +1993,7 @@ pub const Window = extern struct {
         // (e.g. due to a bell character), we now unmark that
         page.setNeedsAttention(@intFromBool(false));
 
-        self.scheduleSidebarRebuild();
+        self.syncSidebarSelection();
     }
 
     fn tabViewPageReordered(
@@ -1812,20 +2005,17 @@ pub const Window = extern struct {
         self.scheduleSidebarRebuild();
     }
 
-    fn pageSidebarPropChanged(
-        _: *adw.TabPage,
-        _: *gobject.ParamSpec,
-        self: *Self,
-    ) callconv(.c) void {
-        self.scheduleSidebarRebuild();
-    }
-
+    /// Name a group that started before its shell reported a directory.
     fn surfacePwdChanged(
         surface: *Surface,
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
-        if (ext.getAncestor(Tab, surface.as(gtk.Widget))) |tab| pinGroupFromPwd(tab);
+        const tab = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse return;
+        const group = self.findGroup(tab.getGroupId()) orelse return;
+        if (group.dir != null) return;
+        const pwd = surface.getPwd() orelse return;
+        setGroupDir(group, pwd);
         self.scheduleSidebarRebuild();
     }
 
@@ -1871,32 +2061,13 @@ pub const Window = extern struct {
             self.connectSurfaceHandlers(tree);
         }
 
-        // Sidebar rows show the page title, attention state and the
-        // active surface's pwd.
-        inline for (.{ "title", "needs-attention" }) |detail| {
-            _ = gobject.Object.signals.notify.connect(
-                page,
-                *Self,
-                pageSidebarPropChanged,
-                self,
-                .{ .detail = detail },
-            );
+        // Tabs from another window (dragged in) join the selected tab's
+        // group, or start one of their own.
+        if (self.findGroup(tab.getGroupId()) == null) {
+            const current = self.selectedGroupId(tab);
+            const dir = if (tab.getActiveSurface()) |s| s.getPwd() else null;
+            tab.setGroupId(if (current != 0) current else self.addGroup(dir));
         }
-        _ = gobject.Object.signals.notify.connect(
-            tab,
-            *Self,
-            tabSidebarPropChanged,
-            self,
-            .{ .detail = "active-surface" },
-        );
-        self.scheduleSidebarRebuild();
-    }
-
-    fn tabSidebarPropChanged(
-        _: *Tab,
-        _: *gobject.ParamSpec,
-        self: *Self,
-    ) callconv(.c) void {
         self.scheduleSidebarRebuild();
     }
 

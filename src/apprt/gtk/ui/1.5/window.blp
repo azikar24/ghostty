@@ -152,20 +152,48 @@ template $GhosttyWindow: Adw.ApplicationWindow {
       Adw.OverlaySplitView sidebar_split {
         collapsed: false;
         show-sidebar: false;
-        min-sidebar-width: 160;
-        max-sidebar-width: 280;
-        sidebar-width-fraction: 0.2;
+        min-sidebar-width: 220;
+        max-sidebar-width: 320;
+        sidebar-width-fraction: 0.22;
 
-        sidebar: Gtk.ScrolledWindow {
-          hscrollbar-policy: never;
+        sidebar: Gtk.Box {
+          styles [
+            "tab-sidebar",
+          ]
 
-          Gtk.ListBox sidebar_list {
+          orientation: vertical;
+
+          Gtk.ScrolledWindow {
+            hscrollbar-policy: never;
+            vexpand: true;
+
+            Gtk.ListBox sidebar_list {
+              styles [
+                "navigation-sidebar",
+              ]
+
+              selection-mode: single;
+              row-activated => $sidebar_row_activated();
+            }
+          }
+
+          Gtk.Separator {}
+
+          Gtk.Button {
             styles [
-              "navigation-sidebar",
+              "flat",
+              "tab-sidebar-footer",
             ]
 
-            selection-mode: single;
-            row-activated => $sidebar_row_activated();
+            action-name: "win.new-group";
+            can-focus: false;
+            focus-on-click: false;
+            tooltip-text: _("New group in the current tab's folder");
+
+            child: Adw.ButtonContent {
+              icon-name: "list-add-symbolic";
+              label: _("New Group");
+            };
           }
         };
 

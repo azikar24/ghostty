@@ -574,6 +574,10 @@ pub const Action = union(enum) {
     /// `gtk-tab-sidebar`.
     toggle_tab_sidebar,
 
+    /// Open a tab in a new sidebar group that starts in the current tab's
+    /// folder. Only supported on Linux (GTK). See `gtk-tab-sidebar`.
+    new_tab_group,
+
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
 
@@ -1389,6 +1393,7 @@ pub const Action = union(enum) {
             .move_tab,
             .toggle_tab_overview,
             .toggle_tab_sidebar,
+            .new_tab_group,
             .new_split,
             .goto_split,
             .goto_window,

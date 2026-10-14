@@ -168,10 +168,9 @@ pub const Tab = extern struct {
         /// The tooltip of this tab. This is usually bound to the active surface.
         tooltip: ?[:0]const u8 = null,
 
-        /// The directory this tab is grouped under in the tab sidebar. Set
-        /// once (explicit working directory, parent tab's group, or the first
-        /// reported pwd) and never changed, so tabs don't jump between groups.
-        group: ?[:0]const u8 = null,
+        /// The sidebar group (owned by the window) this tab belongs to.
+        /// Zero means none yet.
+        group_id: u32 = 0,
 
         // Template bindings
         split_tree: *SplitTree,
@@ -213,8 +212,6 @@ pub const Tab = extern struct {
         }
 
         tab.as(gobject.Object).notifyByPspec(properties.config.impl.param_spec);
-
-        if (overrides.working_directory) |wd| _ = tab.pinGroup(wd);
 
         // Create our initial surface in the split tree.
         priv.split_tree.newSplit(.right, null, .{
@@ -295,18 +292,12 @@ pub const Tab = extern struct {
         return self.getSplitTree().getActiveSurface();
     }
 
-    /// The sidebar group directory, if pinned yet. Not copied.
-    pub fn getGroup(self: *Self) ?[:0]const u8 {
-        return self.private().group;
+    pub fn getGroupId(self: *Self) u32 {
+        return self.private().group_id;
     }
 
-    /// Pin the sidebar group if it isn't pinned yet. Returns true if it
-    /// was set by this call.
-    pub fn pinGroup(self: *Self, dir: [:0]const u8) bool {
-        const priv = self.private();
-        if (priv.group != null or dir.len == 0) return false;
-        priv.group = glib.ext.dupeZ(u8, dir);
-        return true;
+    pub fn setGroupId(self: *Self, id: u32) void {
+        self.private().group_id = id;
     }
 
     /// Get the surface tree of this tab.
@@ -376,10 +367,6 @@ pub const Tab = extern struct {
         if (priv.title_override) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.title_override = null;
-        }
-        if (priv.group) |v| {
-            glib.free(@ptrCast(@constCast(v)));
-            priv.group = null;
         }
 
         gobject.Object.virtual_methods.finalize.call(

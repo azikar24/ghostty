@@ -444,6 +444,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Toggle the sidebar of tabs grouped by directory.",
         }},
 
+        .new_tab_group => comptime &.{.{
+            .action = .new_tab_group,
+            .title = "New Tab Group",
+            .description = "Open a tab in a new sidebar group in the current folder.",
+        }},
+
         .prompt_surface_title => comptime &.{.{
             .action = .prompt_surface_title,
             .title = "Change Terminal Title…",

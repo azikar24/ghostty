@@ -3619,11 +3619,12 @@ else
 @"gtk-wide-tabs": bool = true,
 
 /// If `true` (default), show tabs in a sidebar on the left of the window
-/// instead of the tab bar. Tabs are grouped by the directory they were
-/// opened in: a new tab joins its parent tab's group, otherwise the group
-/// is the first working directory the shell reports (this needs shell
-/// integration). A tab stays in its group even if you `cd` elsewhere; the
-/// sidebar shows the current directory under the title when it differs.
+/// instead of the tab bar, organized into groups. A group is named after
+/// the folder it was created in and new tabs in it start there. New tabs
+/// (`new_tab`) join the current tab's group; `new_tab_group` (default
+/// `ctrl+shift+g`) or the sidebar's "New Group" button starts a group in
+/// the current tab's folder. Groups can be collapsed, renamed and closed
+/// from the sidebar, and disappear when their last tab closes.
 ///
 /// The sidebar can be shown or hidden per window with the
 /// `toggle_tab_sidebar` keybind action (default `ctrl+shift+b`). The tab
@@ -6613,6 +6614,11 @@ pub const Keybinds = struct {
                 alloc,
                 .{ .key = .{ .unicode = 'b' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .toggle_tab_sidebar = {} },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'g' }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .new_tab_group = {} },
             );
             try self.set.put(
                 alloc,

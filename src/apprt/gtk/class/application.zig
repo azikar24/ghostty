@@ -753,6 +753,7 @@ pub const Application = extern struct {
             .toggle_quick_terminal => return Action.toggleQuickTerminal(self),
             .toggle_tab_overview => return Action.toggleTabOverview(target),
             .toggle_tab_sidebar => return Action.toggleTabSidebar(target),
+            .new_tab_group => return Action.newTabGroup(target),
             .toggle_window_decorations => return Action.toggleWindowDecorations(target),
             .toggle_command_palette => return Action.toggleCommandPalette(target),
             .toggle_split_zoom => return Action.toggleSplitZoom(target),
@@ -2736,6 +2737,25 @@ const Action = struct {
                 };
 
                 return window.toggleTabSidebar();
+            },
+        }
+    }
+
+    pub fn newTabGroup(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                const window = ext.getAncestor(
+                    Window,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a window, ignoring new_tab_group", .{});
+                    return false;
+                };
+
+                window.newTabGroup();
+                return true;
             },
         }
     }

@@ -346,6 +346,9 @@ pub const Action = union(Key) {
     /// Toggle the tab sidebar.
     toggle_tab_sidebar,
 
+    /// Open a tab in a new sidebar group.
+    new_tab_group,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -414,6 +417,7 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         toggle_tab_sidebar,
+        new_tab_group,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

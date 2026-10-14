@@ -181,3 +181,71 @@ label.resize-overlay {
   margin: 0;
   padding: 0;
 }
+
+/*
+ * Tab sidebar
+ */
+
+.tab-sidebar row.sidebar-group {
+  min-height: 30px;
+  margin-top: 4px;
+  padding: 2px 4px 2px 6px;
+}
+
+.tab-sidebar row.sidebar-group label.group-name {
+  font-weight: 700;
+}
+
+.tab-sidebar row.sidebar-group label.group-count {
+  font-size: smaller;
+  padding: 0 6px;
+  border-radius: 99px;
+  background-color: alpha(currentColor, 0.1);
+}
+
+.tab-sidebar row.sidebar-group button,
+.tab-sidebar row.sidebar-group menubutton > button {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+}
+
+.tab-sidebar row.sidebar-group .hover-only {
+  opacity: 0;
+}
+
+.tab-sidebar row.sidebar-group:hover .hover-only,
+.tab-sidebar row.sidebar-group .hover-only:checked,
+.tab-sidebar row.sidebar-group menubutton.hover-only > button:checked {
+  opacity: 1;
+}
+
+.tab-sidebar row.sidebar-tab {
+  min-height: 28px;
+  padding: 2px 4px 2px 32px;
+}
+
+.tab-sidebar row.sidebar-tab:selected {
+  box-shadow: inset 3px 0 0 0 var(--accent-bg-color);
+}
+
+.tab-sidebar row.sidebar-tab button.close {
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  opacity: 0;
+}
+
+.tab-sidebar row.sidebar-tab:hover button.close,
+.tab-sidebar row.sidebar-tab:selected button.close {
+  opacity: 1;
+}
+
+.tab-sidebar row.sidebar-tab image.attention {
+  color: var(--accent-color);
+  -gtk-icon-size: 8px;
+}
+
+.tab-sidebar button.tab-sidebar-footer {
+  margin: 6px;
+}
