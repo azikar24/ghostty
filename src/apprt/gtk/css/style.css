@@ -321,3 +321,9 @@ label.resize-overlay {
   color: var(--accent-fg-color);
   background-color: var(--accent-bg-color);
 }
+
+/* Drop target while dragging a sidebar tab, group or tab over it. */
+.tab-sidebar row:drop(active) {
+  box-shadow: inset 0 0 0 2px var(--accent-bg-color);
+  border-radius: 6px;
+}

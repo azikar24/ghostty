@@ -283,6 +283,12 @@ pub const Window = extern struct {
         /// Group whose rename dialog is open.
         renaming_group: u32 = 0,
 
+        /// Sidebar tab whose rename dialog is open.
+        renaming_workspace: u32 = 0,
+
+        /// Right-click menu for sidebar rows; parented to sidebar_box.
+        sidebar_menu: ?*gtk.PopoverMenu = null,
+
         /// Set once the window is going away, so the session save skips it.
         closing: bool = false,
 
@@ -426,6 +432,8 @@ pub const Window = extern struct {
             .init("new-group", actionNewGroup, null),
             .init("toggle-tab-sidebar", actionToggleTabSidebar, null),
             .init("clear-notifications", actionClearNotifications, null),
+            .init("sidebar-tab-rename", actionSidebarTabRename, u_variant_type),
+            .init("sidebar-tab-close", actionSidebarTabClose, u_variant_type),
             .init("group-new-tab", actionGroupNewTab, u_variant_type),
             .init("group-rename", actionGroupRename, u_variant_type),
             .init("group-close", actionGroupClose, u_variant_type),
@@ -832,6 +840,7 @@ pub const Window = extern struct {
         view.setMenuModel(priv.tab_context_menu);
         _ = gobject.Object.signals.notify.connect(view, *Self, tabViewNPages, self, .{ .detail = "n-pages" });
         _ = gobject.Object.signals.notify.connect(view, *Self, tabViewSelectedPage, self, .{ .detail = "selected-page" });
+        _ = gobject.Object.signals.notify.connect(view, *Self, tabViewTransferring, self, .{ .detail = "is-transferring-page" });
         _ = adw.TabView.signals.close_page.connect(view, *Self, tabViewClosePage, self, .{});
         _ = adw.TabView.signals.page_attached.connect(view, *Self, tabViewPageAttached, self, .{});
         _ = adw.TabView.signals.page_detached.connect(view, *Self, tabViewPageDetached, self, .{});
@@ -1335,7 +1344,11 @@ pub const Window = extern struct {
         var i: usize = 0;
         while (i < priv.workspaces.items.len) {
             const ws = priv.workspaces.items[i];
-            if (ws.view.getNPages() > 0 or priv.workspaces.items.len == 1) {
+            // A view whose only tab is being dragged is empty but must stay,
+            // in case the drag is cancelled and the tab comes back.
+            if (ws.view.getNPages() > 0 or ws.view.getIsTransferringPage() != 0 or
+                priv.workspaces.items.len == 1)
+            {
                 i += 1;
                 continue;
             }
@@ -1346,6 +1359,17 @@ pub const Window = extern struct {
                 self.activateWorkspace(next.id);
             }
             priv.tab_stack.remove(ws.view.as(gtk.Widget));
+        }
+
+        // Everything was dragged away: nothing left to show.
+        if (priv.workspaces.items.len == 1) {
+            const view = priv.workspaces.items[0].view;
+            if (view.getNPages() == 0 and view.getIsTransferringPage() == 0 and
+                priv.tab_overview.getOpen() == 0)
+            {
+                self.as(gtk.Window).close();
+                return;
+            }
         }
 
         var gi: usize = 0;
@@ -1393,7 +1417,7 @@ pub const Window = extern struct {
 
         list.append(sidebarSectionRow(i18n._("TABS"), "view-list-symbolic").as(gtk.Widget));
         for (priv.groups.items) |*group| {
-            list.append(sidebarGroupRow(group, self.groupWorkspaceCount(group.id)).as(gtk.Widget));
+            list.append(self.sidebarGroupRow(group, self.groupWorkspaceCount(group.id)).as(gtk.Widget));
             for (priv.workspaces.items) |ws| {
                 if (ws.group_id != group.id) continue;
                 const active = ws.view == priv.tab_view;
@@ -1405,7 +1429,7 @@ pub const Window = extern struct {
         }
     }
 
-    fn sidebarGroupRow(group: *const SidebarGroup, count: usize) *gtk.ListBoxRow {
+    fn sidebarGroupRow(self: *Self, group: *const SidebarGroup, count: usize) *gtk.ListBoxRow {
         const row = gtk.ListBoxRow.new();
         row.setSelectable(0);
         row.as(gtk.Widget).addCssClass("sidebar-group");
@@ -1472,6 +1496,8 @@ pub const Window = extern struct {
         box.append(more.as(gtk.Widget));
 
         row.setChild(box.as(gtk.Widget));
+        var payload: [32]u8 = undefined;
+        self.setupSidebarRow(row, std.fmt.bufPrintZ(&payload, "group:{d}", .{group.id}) catch "", false);
         return row;
     }
 
@@ -1496,7 +1522,20 @@ pub const Window = extern struct {
         title.setEllipsize(.end);
         title.as(gtk.Widget).setHexpand(1);
         if (ws.view.getSelectedPage()) |page| {
-            _ = page.as(gobject.Object).bindProperty("title", title.as(gobject.Object), "label", .{ .sync_create = true });
+            const tab = gobject.ext.cast(Tab, page.getChild());
+            const surface = if (tab) |t| t.getActiveSurface() else null;
+            const unstarted = surface != null and surface.?.getPwd() == null and
+                std.mem.eql(u8, std.mem.span(page.getTitle()), "Ghostty");
+            if (ws.name) |name| {
+                title.setLabel(name.ptr);
+            } else if (unstarted and surface.?.getPwdOrInitial() != null) {
+                // Restored but not shown yet, so its shell hasn't started
+                // and set a title: show where it will start instead.
+                var buf: [std.fs.max_path_bytes + 2]u8 = undefined;
+                title.setLabel(abbrevHome(&buf, surface.?.getPwdOrInitial().?).ptr);
+            } else {
+                _ = page.as(gobject.Object).bindProperty("title", title.as(gobject.Object), "label", .{ .sync_create = true });
+            }
             _ = page.as(gobject.Object).bindProperty("tooltip", row.as(gobject.Object), "tooltip-markup", .{ .sync_create = true });
         }
         box.append(title.as(gtk.Widget));
@@ -1552,7 +1591,221 @@ pub const Window = extern struct {
         box.append(close.as(gtk.Widget));
 
         row.setChild(box.as(gtk.Widget));
+        var payload: [32]u8 = undefined;
+        self.setupSidebarRow(row, std.fmt.bufPrintZ(&payload, "ws:{d}", .{ws.id}) catch "", true);
         return row;
+    }
+
+    //---------------------------------------------------------------
+    // Sidebar drag and drop, context menu
+
+    /// Make a group or sidebar tab row draggable (`payload` is "group:N" or
+    /// "ws:N"), a drop target for other rows (and, for sidebar tabs, for
+    /// tabs dragged from the tab bar), and give it a right-click menu.
+    fn setupSidebarRow(self: *Self, row: *gtk.ListBoxRow, payload: [:0]const u8, accept_tabs: bool) void {
+        const widget = row.as(gtk.Widget);
+        row.as(gobject.Object).setDataFull("ghostty-dnd", glib.ext.dupeZ(u8, payload).ptr, glib.free);
+
+        const source = gtk.DragSource.new();
+        source.setActions(.{ .move = true });
+        _ = gtk.DragSource.signals.prepare.connect(source, *Self, sidebarDragPrepare, self, .{});
+        widget.addController(source.as(gtk.EventController));
+
+        const target = gtk.DropTarget.new(0, .{ .move = true });
+        var types = [_]usize{ gobject.ext.types.string, adw.TabPage.getGObjectType() };
+        target.setGtypes(&types, if (accept_tabs) 2 else 1);
+        _ = gtk.DropTarget.signals.drop.connect(target, *Self, sidebarDrop, self, .{});
+        widget.addController(target.as(gtk.EventController));
+
+        const click = gtk.GestureClick.new();
+        click.as(gtk.GestureSingle).setButton(0);
+        _ = gtk.GestureClick.signals.pressed.connect(click, *Self, sidebarRowPressed, self, .{});
+        widget.addController(click.as(gtk.EventController));
+    }
+
+    fn sidebarDragPrepare(source: *gtk.DragSource, _: f64, _: f64, _: *Self) callconv(.c) ?*gdk.ContentProvider {
+        const widget = source.as(gtk.EventController).getWidget() orelse return null;
+        const raw = widget.as(gobject.Object).getData("ghostty-dnd") orelse return null;
+        var value = gobject.ext.Value.new([:0]const u8);
+        defer value.unset();
+        value.setString(@ptrCast(raw));
+        source.setIcon(gtk.WidgetPaintable.new(widget).as(gdk.Paintable), 0, 0);
+        return gdk.ContentProvider.newForValue(&value);
+    }
+
+    fn sidebarDrop(
+        target: *gtk.DropTarget,
+        value: *gobject.Value,
+        _: f64,
+        y: f64,
+        self: *Self,
+    ) callconv(.c) c_int {
+        const widget = target.as(gtk.EventController).getWidget() orelse return 0;
+        const obj = widget.as(gobject.Object);
+        const on_ws: u32 = if (obj.getData("ghostty-workspace")) |r| @intCast(@intFromPtr(r)) else 0;
+        const on_group: u32 = if (obj.getData("ghostty-group")) |r| @intCast(@intFromPtr(r)) else 0;
+        // Dropped on the lower half: place after the row instead of before.
+        const after = y > @as(f64, @floatFromInt(widget.getHeight())) / 2;
+
+        if (value.f_g_type == gobject.ext.types.string) {
+            const str = std.mem.span(value.getString() orelse return 0);
+            if (std.mem.startsWith(u8, str, "ws:")) {
+                const id = std.fmt.parseInt(u32, str[3..], 10) catch return 0;
+                if (on_ws != 0) {
+                    const ws = self.findWorkspace(on_ws) orelse return 0;
+                    return @intFromBool(self.moveWorkspace(id, ws.group_id, on_ws, after));
+                }
+                if (on_group != 0) return @intFromBool(self.moveWorkspace(id, on_group, 0, true));
+            } else if (std.mem.startsWith(u8, str, "group:")) {
+                const id = std.fmt.parseInt(u32, str[6..], 10) catch return 0;
+                if (on_group != 0) return @intFromBool(self.moveGroup(id, on_group, after));
+            }
+            return 0;
+        }
+
+        // A tab from a tab bar: move it into this sidebar tab. libadwaita
+        // has already detached it from its view for the drag; after a drop
+        // outside a tab bar it asks that view for a new window to put it in
+        // (create-window), and tabViewCreateWindow hands it this view.
+        if (on_ws == 0) return 0;
+        const ws = self.findWorkspace(on_ws) orelse return 0;
+        pending_tab_drop = ws.view;
+        return 1;
+    }
+
+    /// Target view of a tab dropped on a sidebar tab; see sidebarDrop.
+    var pending_tab_drop: ?*adw.TabView = null;
+
+    /// Move a sidebar tab next to `near` (0: to the end of `group_id`).
+    fn moveWorkspace(self: *Self, id: u32, group_id: u32, near: u32, after: bool) bool {
+        if (id == near) return false;
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        const from = for (priv.workspaces.items, 0..) |ws, i| {
+            if (ws.id == id) break i;
+        } else return false;
+        var ws = priv.workspaces.orderedRemove(from);
+        ws.group_id = group_id;
+
+        var index = priv.workspaces.items.len;
+        if (near != 0) {
+            for (priv.workspaces.items, 0..) |other, i| {
+                if (other.id == near) index = if (after) i + 1 else i;
+            }
+        } else {
+            for (priv.workspaces.items, 0..) |other, i| {
+                if (other.group_id == group_id) index = i + 1;
+            }
+        }
+        priv.workspaces.insert(alloc, index, ws) catch {
+            priv.workspaces.appendAssumeCapacity(ws);
+        };
+        if (self.findGroup(group_id)) |group| group.collapsed = false;
+        self.scheduleSidebarRebuild();
+        return true;
+    }
+
+    fn moveGroup(self: *Self, id: u32, near: u32, after: bool) bool {
+        if (id == near) return false;
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        const from = for (priv.groups.items, 0..) |g, i| {
+            if (g.id == id) break i;
+        } else return false;
+        const group = priv.groups.orderedRemove(from);
+        var index = priv.groups.items.len;
+        for (priv.groups.items, 0..) |other, i| {
+            if (other.id == near) index = if (after) i + 1 else i;
+        }
+        priv.groups.insert(alloc, index, group) catch {
+            priv.groups.appendAssumeCapacity(group);
+        };
+        self.scheduleSidebarRebuild();
+        return true;
+    }
+
+    /// Right click: menu. Double click on a sidebar tab: rename it.
+    fn sidebarRowPressed(
+        gesture: *gtk.GestureClick,
+        n_press: c_int,
+        x: f64,
+        y: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const widget = gesture.as(gtk.EventController).getWidget() orelse return;
+        const obj = widget.as(gobject.Object);
+        const button = gesture.as(gtk.GestureSingle).getCurrentButton();
+        const ws_id: u32 = if (obj.getData("ghostty-workspace")) |r| @intCast(@intFromPtr(r)) else 0;
+        const group_id: u32 = if (obj.getData("ghostty-group")) |r| @intCast(@intFromPtr(r)) else 0;
+
+        if (button == 1 and n_press == 2 and ws_id != 0) {
+            self.renameWorkspace(ws_id);
+            return;
+        }
+        if (button != 3) return;
+
+        var buf: [64]u8 = undefined;
+        const menu = gio.Menu.new();
+        defer menu.unref();
+        if (ws_id != 0) {
+            menu.append(i18n._("Rename…"), (std.fmt.bufPrintZ(&buf, "win.sidebar-tab-rename(uint32 {d})", .{ws_id}) catch "").ptr);
+            menu.append(i18n._("Close"), (std.fmt.bufPrintZ(&buf, "win.sidebar-tab-close(uint32 {d})", .{ws_id}) catch "").ptr);
+        } else if (group_id != 0) {
+            menu.append(i18n._("New Tab in Group"), (std.fmt.bufPrintZ(&buf, "win.group-new-tab(uint32 {d})", .{group_id}) catch "").ptr);
+            menu.append(i18n._("Rename Group…"), (std.fmt.bufPrintZ(&buf, "win.group-rename(uint32 {d})", .{group_id}) catch "").ptr);
+            menu.append(i18n._("Close Group"), (std.fmt.bufPrintZ(&buf, "win.group-close(uint32 {d})", .{group_id}) catch "").ptr);
+        } else return;
+        self.popupSidebarMenu(widget, x, y, menu.as(gio.MenuModel));
+    }
+
+    fn popupSidebarMenu(self: *Self, widget: *gtk.Widget, x: f64, y: f64, model: *gio.MenuModel) void {
+        const priv = self.private();
+        const parent = priv.sidebar_box.as(gtk.Widget);
+        const menu = priv.sidebar_menu orelse menu: {
+            const menu = gtk.PopoverMenu.newFromModel(null);
+            menu.as(gtk.Popover).setHasArrow(0);
+            menu.as(gtk.Widget).setHalign(.start);
+            menu.as(gtk.Widget).setParent(parent);
+            priv.sidebar_menu = menu;
+            break :menu menu;
+        };
+        var px: f64 = 0;
+        var py: f64 = 0;
+        if (widget.translateCoordinates(parent, x, y, &px, &py) == 0) return;
+        menu.setMenuModel(model);
+        const rect: gdk.Rectangle = .{ .f_x = @intFromFloat(px), .f_y = @intFromFloat(py), .f_width = 1, .f_height = 1 };
+        menu.as(gtk.Popover).setPointingTo(&rect);
+        menu.as(gtk.Popover).popup();
+    }
+
+    fn renameWorkspace(self: *Self, id: u32) void {
+        const ws = self.findWorkspace(id) orelse return;
+        self.private().renaming_workspace = id;
+        const current: ?[:0]const u8 = if (ws.name) |name| name else if (ws.view.getSelectedPage()) |page|
+            std.mem.span(page.getTitle())
+        else
+            null;
+        const dialog = TitleDialog.new(.sidebar_tab, current);
+        _ = TitleDialog.signals.set.connect(dialog, *Self, workspaceRenameSet, self, .{});
+        dialog.present(self.as(gtk.Widget));
+    }
+
+    fn workspaceRenameSet(_: *TitleDialog, title_ptr: [*:0]const u8, self: *Self) callconv(.c) void {
+        const ws = self.findWorkspace(self.private().renaming_workspace) orelse return;
+        const alloc = Application.default().allocator();
+        const title = std.mem.span(title_ptr);
+        if (ws.name) |name| alloc.free(name);
+        // An empty name goes back to showing the selected tab's title.
+        ws.name = if (title.len == 0) null else alloc.dupeZ(u8, title) catch null;
+        self.scheduleSidebarRebuild();
+    }
+
+    fn actionSidebarTabRename(_: *gio.SimpleAction, param: ?*glib.Variant, self: *Self) callconv(.c) void {
+        self.renameWorkspace((param orelse return).getUint32());
+    }
+
+    fn actionSidebarTabClose(_: *gio.SimpleAction, param: ?*glib.Variant, self: *Self) callconv(.c) void {
+        self.closeWorkspace((param orelse return).getUint32());
     }
 
     fn sidebarRowActivated(
@@ -2295,6 +2548,11 @@ pub const Window = extern struct {
 
         priv.command_palette.set(null);
 
+        if (priv.sidebar_menu) |menu| {
+            menu.as(gtk.Widget).unparent();
+            priv.sidebar_menu = null;
+        }
+
         if (priv.sidebar_rebuild) |v| {
             if (glib.Source.remove(v) == 0) {
                 log.warn("unable to remove sidebar rebuild source", .{});
@@ -2585,6 +2843,14 @@ pub const Window = extern struct {
         if (self.as(gtk.Window).isActive() != 0) self.clearNotificationsFor(page);
     }
 
+    fn tabViewTransferring(
+        _: *adw.TabView,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        self.scheduleSidebarRebuild();
+    }
+
     fn tabViewPageReordered(
         _: *adw.TabView,
         _: *adw.TabPage,
@@ -2712,6 +2978,12 @@ pub const Window = extern struct {
         _: *adw.TabView,
         _: *Self,
     ) callconv(.c) ?*adw.TabView {
+        // A tab dropped on a sidebar tab goes there, not to a new window.
+        if (pending_tab_drop) |view| {
+            pending_tab_drop = null;
+            return view;
+        }
+
         // Create a new window without creating a new tab.
         const win = gobject.ext.newInstance(
             Self,
@@ -2747,6 +3019,8 @@ pub const Window = extern struct {
         // Counts on sidebar rows; empty sidebar tabs are pruned on idle.
         self.scheduleSidebarRebuild();
         if (view.getNPages() != 0) return;
+        // Its tab is being dragged; decided when the drag ends (pruning).
+        if (view.getIsTransferringPage() != 0) return;
 
         // Another sidebar tab still has tabs: show it instead of closing.
         if (view == priv.tab_view) {
