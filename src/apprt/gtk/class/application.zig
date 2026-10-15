@@ -1402,7 +1402,11 @@ pub const Application = extern struct {
         const as_variant_type = glib.VariantType.new("as");
         defer as_variant_type.free();
 
+        const group_variant_type = glib.VariantType.new("(ssas)");
+        defer group_variant_type.free();
+
         const actions = [_]ext.actions.Action(Self){
+            .init("new-group", actionNewGroup, group_variant_type),
             .init("new-window", actionNewWindow, null),
             .init("new-window-command", actionNewWindow, as_variant_type),
             .init("open-config", actionOpenConfig, null),
@@ -1781,6 +1785,41 @@ pub const Application = extern struct {
         }) catch |err| {
             log.warn("unable to create new window: {t}", .{err});
         };
+    }
+
+    /// new-group (name, dir, [sidebar tab names]): show or create that
+    /// sidebar group in the active window. For scripts over D-Bus, e.g.:
+    ///   gdbus call --session --dest com.mitchellh.ghostty \
+    ///     --object-path /com/mitchellh/ghostty \
+    ///     --method org.gtk.Actions.Activate new-group \
+    ///     "[<('box', '/home/me/ctf/box', ['recon', 'exploit'])>]" "{}"
+    pub fn actionNewGroup(
+        _: *gio.SimpleAction,
+        parameter_: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const parameter = parameter_ orelse return;
+        const window = gobject.ext.cast(
+            Window,
+            self.as(gtk.Application).getActiveWindow() orelse return,
+        ) orelse return;
+
+        var name: [*:0]const u8 = undefined;
+        var dir: [*:0]const u8 = undefined;
+        var tabs_variant: *glib.Variant = undefined;
+        parameter.get("(&s&s@as)", &name, &dir, &tabs_variant);
+        defer tabs_variant.unref();
+
+        var tabs: [16][:0]const u8 = undefined;
+        const n = @min(tabs_variant.nChildren(), tabs.len);
+        for (0..n) |i| {
+            const child = tabs_variant.getChildValue(i);
+            defer child.unref();
+            var len: usize = 0;
+            tabs[i] = std.mem.span(child.getString(&len));
+        }
+        // getString points into the child, which the array keeps alive.
+        window.openGroup(std.mem.span(name), std.mem.span(dir), tabs[0..n]);
     }
 
     pub fn actionOpenConfig(

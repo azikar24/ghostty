@@ -339,3 +339,31 @@ label.resize-overlay {
   outline-offset: -2px;
   border-radius: 4px;
 }
+
+.tab-sidebar label.group-target {
+  font-size: smaller;
+  font-family: monospace;
+  padding: 0 6px;
+  border-radius: 99px;
+  color: var(--error-color);
+  background-color: alpha(var(--error-color), 0.12);
+}
+
+.tab-sidebar .tab-sidebar-vpn {
+  padding: 6px 12px 0 14px;
+  font-size: smaller;
+  font-family: monospace;
+}
+
+.tab-sidebar .tab-sidebar-vpn image {
+  -gtk-icon-size: 8px;
+  color: alpha(currentColor, 0.4);
+}
+
+.tab-sidebar .tab-sidebar-vpn.up image {
+  color: var(--success-color);
+}
+
+.tab-sidebar .tab-sidebar-vpn:not(.up) label {
+  opacity: 0.6;
+}

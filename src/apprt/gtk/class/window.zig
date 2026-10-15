@@ -312,6 +312,8 @@ pub const Window = extern struct {
         sidebar_box: *gtk.Box,
         sidebar_rail: *gtk.Box,
         sidebar_list: *gtk.ListBox,
+        sidebar_vpn: *gtk.Box,
+        sidebar_vpn_label: *gtk.Label,
 
         pub var offset: c_int = 0;
     };
@@ -759,6 +761,10 @@ pub const Window = extern struct {
         /// Set by the user, so a later `dir` doesn't rename it.
         renamed: bool = false,
         collapsed: bool = false,
+        /// First line of `<dir>/.target` (e.g. a CTF box's IP), shown on
+        /// the header; refreshed by detailsTick.
+        target: [64]u8 = undefined,
+        target_len: usize = 0,
 
         fn deinit(self: *SidebarGroup, alloc: std.mem.Allocator) void {
             alloc.free(self.name);
@@ -918,6 +924,51 @@ pub const Window = extern struct {
         const group = self.findGroup(group_id) orelse return;
         group.collapsed = false;
         self.newWorkspace(group_id, group.dir);
+    }
+
+    /// Show the group for `dir`, creating it (named `name`, with a sidebar
+    /// tab per entry of `tabs`, all in `dir`) if this window has none.
+    /// Used by the app's "new-group" D-Bus action (e.g. from mkctf).
+    pub fn openGroup(self: *Self, name: [:0]const u8, dir: [:0]const u8, tabs: []const [:0]const u8) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        for (priv.groups.items) |group| {
+            const d = group.dir orelse continue;
+            if (!std.mem.eql(u8, std.mem.trimRight(u8, d, "/"), std.mem.trimRight(u8, dir, "/"))) continue;
+            for (priv.workspaces.items) |ws| {
+                if (ws.group_id != group.id) continue;
+                self.activateWorkspace(ws.id);
+                break;
+            }
+            self.as(gtk.Window).present();
+            return;
+        }
+
+        const group_id = self.addGroup(dir);
+        if (group_id == 0) return;
+        if (name.len > 0) if (self.findGroup(group_id)) |group| {
+            if (alloc.dupeZ(u8, name)) |copy| {
+                alloc.free(group.name);
+                group.name = copy;
+                group.renamed = true;
+            } else |_| {}
+        };
+
+        var first: u32 = 0;
+        const names: []const [:0]const u8 = if (tabs.len > 0) tabs else &.{""};
+        for (names) |tab_name| {
+            const ws_id = self.addWorkspace(group_id);
+            if (ws_id == 0) continue;
+            if (first == 0) first = ws_id;
+            self.activateWorkspace(ws_id);
+            _ = self.newTabPage(null, .tab, .{ .working_directory = dir });
+            if (tab_name.len > 0) if (self.findWorkspace(ws_id)) |ws| {
+                ws.name = alloc.dupeZ(u8, tab_name) catch null;
+            };
+        }
+        if (first != 0) self.activateWorkspace(first);
+        self.as(gtk.Window).present();
     }
 
     /// Open a sidebar tab in the current one's group.
@@ -1338,6 +1389,32 @@ pub const Window = extern struct {
         const priv = self.private();
         if (!self.sidebarShown() or self.as(gtk.Widget).getMapped() == 0) return 1;
         var changed = false;
+
+        for (priv.groups.items) |*group| {
+            var target_buf: [64]u8 = undefined;
+            const target: []const u8 = if (group.dir) |dir|
+                procinfo.firstLine(&target_buf, dir, ".target") orelse ""
+            else
+                "";
+            const len = @min(target.len, group.target.len);
+            if (std.mem.eql(u8, target[0..len], group.target[0..group.target_len])) continue;
+            @memcpy(group.target[0..len], target[0..len]);
+            group.target_len = len;
+            changed = true;
+        }
+
+        {
+            var name_buf: [32]u8 = undefined;
+            var addr_buf: [32]u8 = undefined;
+            var text_buf: [80]u8 = undefined;
+            const vpn = procinfo.vpnAddress(&name_buf, &addr_buf);
+            const text: [*:0]const u8 = if (vpn) |v|
+                (std.fmt.bufPrintZ(&text_buf, "{s} {s}", .{ v.name, v.addr }) catch "VPN").ptr
+            else
+                i18n._("VPN off");
+            priv.sidebar_vpn_label.setLabel(text);
+            if (vpn != null) priv.sidebar_vpn.as(gtk.Widget).addCssClass("up") else priv.sidebar_vpn.as(gtk.Widget).removeCssClass("up");
+        }
         for (priv.workspaces.items) |*ws| {
             // A group started by a command without shell integration never
             // gets a pwd report; name it from the process's directory.
@@ -1614,12 +1691,20 @@ pub const Window = extern struct {
         const name = gtk.Label.new(group.name.ptr);
         name.setXalign(0);
         name.setEllipsize(.end);
-        name.setWidthChars(6);
+        name.setWidthChars(8);
         name.as(gtk.Widget).setHexpand(1);
         name.as(gtk.Widget).addCssClass("group-name");
         box.append(name.as(gtk.Widget));
 
-        var buf: [64]u8 = undefined;
+        var buf: [96]u8 = undefined;
+        if (group.target_len > 0) {
+            const target = gtk.Label.new((std.fmt.bufPrintZ(&buf, "{s}", .{group.target[0..group.target_len]}) catch "").ptr);
+            target.as(gtk.Widget).addCssClass("group-target");
+            target.as(gtk.Widget).setValign(.center);
+            target.as(gtk.Widget).setTooltipText(i18n._("Target (from .target in the group's folder)"));
+            box.append(target.as(gtk.Widget));
+        }
+
         const count_label = gtk.Label.new((std.fmt.bufPrintZ(&buf, "{d}", .{count}) catch "").ptr);
         count_label.as(gtk.Widget).addCssClass("group-count");
         count_label.as(gtk.Widget).addCssClass("dim-label");
@@ -3734,6 +3819,8 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("sidebar_box", .{});
             class.bindTemplateChildPrivate("sidebar_rail", .{});
             class.bindTemplateChildPrivate("sidebar_list", .{});
+            class.bindTemplateChildPrivate("sidebar_vpn", .{});
+            class.bindTemplateChildPrivate("sidebar_vpn_label", .{});
             class.bindTemplateChildPrivate("toolbar", .{});
             class.bindTemplateChildPrivate("toast_overlay", .{});
             class.bindTemplateChildPrivate("content_box", .{});

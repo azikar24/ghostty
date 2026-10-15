@@ -189,6 +189,28 @@ template $GhosttyWindow: Adw.ApplicationWindow {
 
           Gtk.Separator {}
 
+          // VPN interface and address (window.zig detailsTick).
+          Gtk.Box sidebar_vpn {
+            styles [
+              "tab-sidebar-vpn",
+            ]
+
+            orientation: horizontal;
+            spacing: 6;
+
+            Gtk.Image sidebar_vpn_dot {
+              icon-name: "media-record-symbolic";
+              valign: center;
+            }
+
+            Gtk.Label sidebar_vpn_label {
+              label: _("VPN off");
+              xalign: 0;
+              hexpand: true;
+              ellipsize: end;
+            }
+          }
+
           Gtk.Button {
             styles [
               "flat",

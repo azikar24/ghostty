@@ -156,3 +156,42 @@ fn listenPorts(
     }
     return n;
 }
+
+/// The first VPN-style interface (tunN, wgN) that has an IPv4 address:
+/// its name and address, written into the buffers. Null if none is up.
+pub fn vpnAddress(name_buf: []u8, addr_buf: []u8) ?struct { name: []const u8, addr: []const u8 } {
+    var dir = std.fs.openDirAbsolute("/sys/class/net", .{ .iterate = true }) catch return null;
+    defer dir.close();
+    var it = dir.iterate();
+    while (it.next() catch return null) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "tun") and !std.mem.startsWith(u8, entry.name, "wg")) continue;
+        const addr = ipv4Of(entry.name, addr_buf) orelse continue;
+        if (entry.name.len > name_buf.len) continue;
+        @memcpy(name_buf[0..entry.name.len], entry.name);
+        return .{ .name = name_buf[0..entry.name.len], .addr = addr };
+    }
+    return null;
+}
+
+fn ipv4Of(name: []const u8, buf: []u8) ?[]const u8 {
+    const linux = std.os.linux;
+    const fd = std.posix.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0) catch return null;
+    defer std.posix.close(fd);
+    var ifr = std.mem.zeroes(linux.ifreq);
+    if (name.len >= ifr.ifrn.name.len) return null;
+    @memcpy(ifr.ifrn.name[0..name.len], name);
+    if (linux.E.init(linux.ioctl(fd, linux.SIOCGIFADDR, @intFromPtr(&ifr))) != .SUCCESS) return null;
+    const sin: *align(1) const linux.sockaddr.in = @ptrCast(&ifr.ifru.addr);
+    const ip: [4]u8 = @bitCast(sin.addr);
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch null;
+}
+
+/// First line of `<dir>/<name>`, trimmed, written into `buf`; null if the
+/// file is missing or empty. For the `.target` file shown on group headers.
+pub fn firstLine(buf: []u8, dir: []const u8, name: []const u8) ?[]const u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return null;
+    const data = std.fs.cwd().readFile(path, buf) catch return null;
+    const line = std.mem.trim(u8, std.mem.sliceTo(data, '\n'), " \t\r");
+    return if (line.len == 0) null else line;
+}
