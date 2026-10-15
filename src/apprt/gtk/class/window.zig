@@ -30,6 +30,7 @@ const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
 const session = @import("../session.zig");
+const procinfo = @import("../procinfo.zig");
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 
 const log = std.log.scoped(.gtk_ghostty_window);
@@ -289,6 +290,9 @@ pub const Window = extern struct {
         /// Right-click menu for sidebar rows; parented to sidebar_box.
         sidebar_menu: ?*gtk.PopoverMenu = null,
 
+        /// Periodic refresh of sidebar tab details (detailsTick).
+        details_timer: ?c_uint = null,
+
         /// Set once the window is going away, so the session save skips it.
         closing: bool = false,
 
@@ -374,6 +378,7 @@ pub const Window = extern struct {
         const first = self.addWorkspace(self.addGroup(null));
         if (first == 0) @panic("oom");
         self.activateWorkspace(first);
+        priv.details_timer = glib.timeoutAddSeconds(2, detailsTick, self);
 
         // Initialize our actions
         self.initActionMap();
@@ -768,6 +773,14 @@ pub const Window = extern struct {
         view: *adw.TabView,
         /// Set by the user; otherwise the row shows the selected tab's title.
         name: ?[:0]u8 = null,
+        /// "dir · branch · :ports" line under the title, refreshed by
+        /// detailsTick; rows only rebuild when it changes.
+        details: [192]u8 = undefined,
+        details_len: usize = 0,
+
+        fn getDetails(self: *const Workspace) []const u8 {
+            return self.details[0..self.details_len];
+        }
     };
 
     var next_group_id: u32 = 1;
@@ -1011,7 +1024,10 @@ pub const Window = extern struct {
     ) !session.Node {
         switch (tree.nodes[handle.idx()]) {
             .leaf => |surface| return .{
-                .pwd = if (surface.getPwdOrInitial()) |p| try alloc.dupe(u8, p) else null,
+                .pwd = pwd: {
+                    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+                    break :pwd if (surfaceDir(surface, &buf)) |p| try alloc.dupe(u8, p) else null;
+                },
             },
             .split => |split| {
                 const left = try alloc.create(session.Node);
@@ -1314,6 +1330,152 @@ pub const Window = extern struct {
     }
 
     //---------------------------------------------------------------
+    // Sidebar tab details and attention rings
+
+    /// Recompute every sidebar tab's details line; redraw if any changed.
+    fn detailsTick(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        const priv = self.private();
+        if (!self.sidebarShown() or self.as(gtk.Widget).getMapped() == 0) return 1;
+        var changed = false;
+        for (priv.workspaces.items) |*ws| {
+            // A group started by a command without shell integration never
+            // gets a pwd report; name it from the process's directory.
+            if (self.findGroup(ws.group_id)) |group| if (group.dir == null) {
+                if (ws.view.getSelectedPage()) |page| if (gobject.ext.cast(Tab, page.getChild())) |tab| {
+                    if (tab.getActiveSurface()) |surface| {
+                        var dir_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+                        if (surfaceDir(surface, &dir_buf)) |dir| {
+                            setGroupDir(group, dir);
+                            changed = true;
+                        }
+                    }
+                };
+            };
+            var buf: [192]u8 = undefined;
+            const details = workspaceDetails(ws.view, &buf);
+            if (std.mem.eql(u8, details, ws.getDetails())) continue;
+            @memcpy(ws.details[0..details.len], details);
+            ws.details_len = details.len;
+            changed = true;
+        }
+        if (changed) self.scheduleSidebarRebuild();
+        return 1;
+    }
+
+    /// "branch · :8000 :4444 · ~/dir" for a sidebar tab: its selected tab's
+    /// git branch, ports listened on by any of its terminals, and folder
+    /// last (the label truncates at the end, so that goes first).
+    fn workspaceDetails(view: *adw.TabView, buf: []u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        var dir_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        const pwd: ?[:0]const u8 = pwd: {
+            const page = view.getSelectedPage() orelse break :pwd null;
+            const tab = gobject.ext.cast(Tab, page.getChild()) orelse break :pwd null;
+            const surface = tab.getActiveSurface() orelse break :pwd null;
+            break :pwd surfaceDir(surface, &dir_buf);
+        };
+
+        if (pwd) |dir| {
+            var branch_buf: [128]u8 = undefined;
+            if (procinfo.gitBranch(&branch_buf, dir)) |branch| w.writeAll(branch) catch {};
+        }
+
+        var pids: [64]std.posix.pid_t = undefined;
+        var n_pids: usize = 0;
+        for (0..@intCast(view.getNPages())) |i| {
+            const tab = gobject.ext.cast(Tab, view.getNthPage(@intCast(i)).getChild()) orelse continue;
+            const tree = tab.getSurfaceTree() orelse continue;
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                const pid = surfacePid(entry.view) orelse continue;
+                if (n_pids == pids.len) break;
+                pids[n_pids] = pid;
+                n_pids += 1;
+            }
+        }
+        var ports: [16]u16 = undefined;
+        const n_ports = procinfo.listeningPorts(Application.default().allocator(), pids[0..n_pids], &ports);
+        for (ports[0..n_ports], 0..) |port, i| {
+            if (i == 0 and w.end > 0) w.writeAll(" ·") catch {};
+            w.print("{s}:{d}", .{ if (w.end > 0) " " else "", port }) catch {};
+        }
+
+        if (pwd) |dir| {
+            var home_buf: [std.fs.max_path_bytes + 2]u8 = undefined;
+            if (w.end > 0) w.writeAll(" · ") catch {};
+            w.writeAll(abbrevHome(&home_buf, dir)) catch {};
+        }
+        return w.buffered();
+    }
+
+    /// Where a terminal is: what its shell reported (shell integration),
+    /// else its process's working directory, else where it was asked to
+    /// start (not started yet). Points into `buf` or the surface.
+    fn surfaceDir(surface: *Surface, buf: *[std.fs.max_path_bytes:0]u8) ?[:0]const u8 {
+        if (surface.getPwd()) |pwd| return pwd;
+        if (surfacePid(surface)) |pid| {
+            var path_buf: [64]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cwd", .{pid}) catch "";
+            if (std.fs.readLinkAbsolute(path, buf)) |dir| {
+                buf[dir.len] = 0;
+                return buf[0..dir.len :0];
+            } else |_| {}
+        }
+        return surface.getPwdOrInitial();
+    }
+
+    /// The pid of the shell (or command) a terminal started, if running.
+    fn surfacePid(surface: *Surface) ?std.posix.pid_t {
+        const core = surface.core() orelse return null;
+        const process = core.io.backend.exec.subprocess.process orelse return null;
+        return switch (process) {
+            .fork_exec => |cmd| cmd.pid,
+            .flatpak => null,
+        };
+    }
+
+    /// Ring the terminals that have unseen notifications.
+    fn syncAttentionRings(self: *Self) void {
+        const priv = self.private();
+        for (priv.workspaces.items) |ws| {
+            for (0..@intCast(ws.view.getNPages())) |i| {
+                const tab = gobject.ext.cast(Tab, ws.view.getNthPage(@intCast(i)).getChild()) orelse continue;
+                const tree = tab.getSurfaceTree() orelse continue;
+                var it = tree.iterator();
+                while (it.next()) |entry| {
+                    const has = for (priv.notifications.items) |n| {
+                        if (n.surface == entry.view) break true;
+                    } else false;
+                    const widget = entry.view.as(gtk.Widget);
+                    if (has) widget.addCssClass("ghostty-needs-you") else widget.removeCssClass("ghostty-needs-you");
+                }
+            }
+        }
+    }
+
+    /// Focusing a terminal sees its notifications.
+    fn surfaceFocusedChanged(
+        surface: *Surface,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        if (!surface.getFocused() or self.as(gtk.Window).isActive() == 0) return;
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        var i: usize = 0;
+        var changed = false;
+        while (i < priv.notifications.items.len) {
+            if (priv.notifications.items[i].surface == surface) {
+                var n = priv.notifications.orderedRemove(i);
+                n.deinit(alloc);
+                changed = true;
+            } else i += 1;
+        }
+        if (changed) self.scheduleSidebarRebuild();
+    }
+
+    //---------------------------------------------------------------
     // Sidebar rows
 
     /// Rebuild the sidebar on idle, so a burst of changes rebuilds once.
@@ -1331,6 +1493,7 @@ pub const Window = extern struct {
         defer priv.sidebar_rebuilding = false;
         self.pruneWorkspaces();
         if (self.sidebarShown()) self.rebuildSidebar();
+        self.syncAttentionRings();
         if (!priv.closing) session.scheduleSave();
         return 0;
     }
@@ -1538,7 +1701,22 @@ pub const Window = extern struct {
             }
             _ = page.as(gobject.Object).bindProperty("tooltip", row.as(gobject.Object), "tooltip-markup", .{ .sync_create = true });
         }
-        box.append(title.as(gtk.Widget));
+
+        // Title over a details line (folder, branch, ports) when known.
+        const text = gtk.Box.new(.vertical, 0);
+        text.as(gtk.Widget).setHexpand(1);
+        text.as(gtk.Widget).setValign(.center);
+        text.append(title.as(gtk.Widget));
+        if (ws.details_len > 0) {
+            var buf: [200]u8 = undefined;
+            const details = gtk.Label.new((std.fmt.bufPrintZ(&buf, "{s}", .{ws.getDetails()}) catch "").ptr);
+            details.setXalign(0);
+            details.setEllipsize(.end);
+            details.as(gtk.Widget).addCssClass("tab-details");
+            details.as(gtk.Widget).addCssClass("dim-label");
+            text.append(details.as(gtk.Widget));
+        }
+        box.append(text.as(gtk.Widget));
 
         // Bell in a background tab.
         const n: usize = @intCast(ws.view.getNPages());
@@ -2122,6 +2300,13 @@ pub const Window = extern struct {
                 self,
                 .{ .detail = "pwd" },
             );
+            _ = gobject.Object.signals.notify.connect(
+                surface,
+                *Self,
+                surfaceFocusedChanged,
+                self,
+                .{ .detail = "focused" },
+            );
 
             // If we've never had a surface initialize yet, then we register
             // this signal. Its theoretically possible to launch multiple surfaces
@@ -2551,6 +2736,11 @@ pub const Window = extern struct {
         if (priv.sidebar_menu) |menu| {
             menu.as(gtk.Widget).unparent();
             priv.sidebar_menu = null;
+        }
+
+        if (priv.details_timer) |v| {
+            if (glib.Source.remove(v) == 0) log.warn("unable to remove details timer", .{});
+            priv.details_timer = null;
         }
 
         if (priv.sidebar_rebuild) |v| {
